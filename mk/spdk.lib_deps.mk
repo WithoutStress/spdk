@@ -168,6 +168,7 @@ DEPDIRS-bdev_xnvme := $(BDEV_DEPS_THREAD)
 
 # module/fsdev
 DEPDIRS-fsdev_aio := $(FSDEV_DEPS_THREAD)
+DEPDIRS-fsdev_fsssd := $(FSDEV_DEPS_THREAD)
 
 # module/event
 

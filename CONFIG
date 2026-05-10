@@ -239,6 +239,8 @@ CONFIG_GOLANG=n
 # Build fsdev
 CONFIG_FSDEV=y
 
+CONFIG_FSSSD_FSDEV=y
+
 # Build with aio fsdev
 CONFIG_AIO_FSDEV=y
 

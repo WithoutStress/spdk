@@ -11,6 +11,10 @@ ifeq ($(CONFIG_AIO_FSDEV), y)
 DIRS-y += aio
 endif
 
+ifeq ($(CONFIG_FSSSD_FSDEV), y)
+DIRS-y += fsssd
+endif
+
 .PHONY: all clean $(DIRS-y)
 
 all: $(DIRS-y)
