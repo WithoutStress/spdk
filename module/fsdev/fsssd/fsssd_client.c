@@ -22,6 +22,37 @@ fsssd_attr_from_rsp(struct fsssd_attr *attr, uint64_t ino)
 	attr->blksize = 4096;
 }
 
+static void
+fsssd_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fattr *wire, uint64_t ino)
+{
+	memset(attr, 0, sizeof(*attr));
+	attr->ino = wire->fileid ? wire->fileid : ino;
+	attr->size = wire->size;
+	attr->blocks = wire->used / 512;
+	attr->atime = wire->atime.tv_sec;
+	attr->mtime = wire->mtime.tv_sec;
+	attr->ctime = wire->ctime.tv_sec;
+	attr->mode = wire->mode;
+	attr->nlink = wire->nlink;
+	attr->uid = wire->uid;
+	attr->gid = wire->gid;
+	attr->blksize = FSSSD_NFS_PAGE_SIZE;
+}
+
+static void
+fsssd_statfs_from_wire(struct fsssd_statfs *statfs, const struct fsssd_nfs_fsstat *wire)
+{
+	memset(statfs, 0, sizeof(*statfs));
+	statfs->blocks = wire->tbytes / FSSSD_NFS_PAGE_SIZE;
+	statfs->bfree = wire->fbytes / FSSSD_NFS_PAGE_SIZE;
+	statfs->bavail = wire->abytes / FSSSD_NFS_PAGE_SIZE;
+	statfs->files = wire->tfiles;
+	statfs->ffree = wire->ffiles;
+	statfs->bsize = FSSSD_NFS_PAGE_SIZE;
+	statfs->namelen = FSSSD_NFS_MAX_NAME_LEN;
+	statfs->frsize = FSSSD_NFS_PAGE_SIZE;
+}
+
 struct fsssd_client *
 fsssd_client_create(const struct fsssd_client_opts *opts)
 {
@@ -92,6 +123,7 @@ fsssd_client_getattr(struct fsssd_client *client, uint64_t ino, struct fsssd_att
 {
 	struct fsssd_request req = {};
 	struct fsssd_response rsp = {};
+	struct fsssd_nfs_fattr wire_attr = {};
 	int rc;
 
 	if (client == NULL || attr == NULL) {
@@ -100,12 +132,14 @@ fsssd_client_getattr(struct fsssd_client *client, uint64_t ino, struct fsssd_att
 
 	req.opcode = fsssd_cmd_nfs_getattr;
 	req.handle = ino;
+	req.payload = &wire_attr;
+	req.payload_len = sizeof(wire_attr);
 	rc = fsssd_transport_submit(client->transport, &req, &rsp);
 	if (rc != 0) {
 		return rc;
 	}
 
-	fsssd_attr_from_rsp(attr, ino);
+	fsssd_attr_from_wire(attr, &wire_attr, ino);
 
 	return 0;
 }
@@ -141,6 +175,7 @@ fsssd_client_statfs(struct fsssd_client *client, uint64_t ino, struct fsssd_stat
 {
 	struct fsssd_request req = {};
 	struct fsssd_response rsp = {};
+	struct fsssd_nfs_fsstat wire_statfs = {};
 	int rc;
 
 	if (client == NULL || statfs == NULL) {
@@ -149,12 +184,14 @@ fsssd_client_statfs(struct fsssd_client *client, uint64_t ino, struct fsssd_stat
 
 	req.opcode = fsssd_cmd_nfs_fsstat;
 	req.handle = ino;
+	req.payload = &wire_statfs;
+	req.payload_len = sizeof(wire_statfs);
 	rc = fsssd_transport_submit(client->transport, &req, &rsp);
 	if (rc != 0) {
 		return rc;
 	}
 
-	memset(statfs, 0, sizeof(*statfs));
+	fsssd_statfs_from_wire(statfs, &wire_statfs);
 
 	return 0;
 }

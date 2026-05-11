@@ -3,6 +3,10 @@
 
 #include "spdk/stdinc.h"
 
+#define FSSSD_NFS_PAGE_SIZE 4096
+#define FSSSD_NFS_MAX_NAME_LEN 32
+#define FSSSD_NVME_CMD_TIMEOUT_SEC 30
+
 enum fsssd_nfs_opcode {
 	fsssd_cmd_nfs_symlink	= 0x50,
 	fsssd_cmd_nfs_write	= 0x51,
@@ -35,6 +39,57 @@ struct fsssd_cdw3 {
 		} s;
 		uint32_t val;
 	};
+};
+
+struct fsssd_nfs_fsid {
+	uint64_t major;
+	uint64_t minor;
+};
+
+struct fsssd_nfs_timespec {
+	int64_t tv_sec;
+	int64_t tv_nsec;
+};
+
+struct fsssd_nfs_fattr {
+	uint16_t valid1;
+	uint16_t valid2;
+	uint16_t mode;
+	uint16_t reserved0;
+	uint32_t nlink;
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t rdev;
+	uint64_t size;
+	uint64_t used;
+	struct fsssd_nfs_fsid fsid;
+	uint64_t fileid;
+	uint64_t reserved;
+	struct fsssd_nfs_timespec atime;
+	struct fsssd_nfs_timespec mtime;
+	struct fsssd_nfs_timespec ctime;
+	uint64_t change_attr;
+	uint64_t pre_change_attr;
+	uint64_t pre_size;
+	struct fsssd_nfs_timespec pre_mtime;
+	struct fsssd_nfs_timespec pre_ctime;
+	uint64_t time_start;
+	uint64_t gencount;
+	uint32_t tenant_id;
+	uint32_t dummy1;
+	uint64_t dummy2;
+	uint64_t dummy3;
+	uint64_t dummy4;
+};
+
+struct fsssd_nfs_fsstat {
+	uint64_t fattr;
+	uint64_t tbytes;
+	uint64_t fbytes;
+	uint64_t abytes;
+	uint64_t tfiles;
+	uint64_t ffiles;
+	uint64_t afiles;
 };
 
 #endif

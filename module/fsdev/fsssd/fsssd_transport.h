@@ -20,6 +20,8 @@ struct fsssd_request {
 	size_t size;
 	struct iovec *iov;
 	uint32_t iovcnt;
+	void *payload;
+	uint32_t payload_len;
 };
 
 struct fsssd_response {
