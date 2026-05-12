@@ -4,7 +4,7 @@
 #include "spdk/stdinc.h"
 
 #define FSSSD_NFS_PAGE_SIZE 4096
-#define FSSSD_NFS_MAX_NAME_LEN 32
+#define FSSSD_NFS_MAX_NAME_LEN 24
 #define FSSSD_NVME_CMD_TIMEOUT_SEC 30
 
 enum fsssd_nfs_opcode {

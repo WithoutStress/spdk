@@ -16,6 +16,7 @@ struct fsssd_request {
 	enum fsssd_nfs_opcode opcode;
 	uint64_t handle;
 	const char *name;
+	uint16_t mode;
 	uint64_t offset;
 	size_t size;
 	struct iovec *iov;

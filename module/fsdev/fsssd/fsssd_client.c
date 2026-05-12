@@ -171,6 +171,33 @@ fsssd_client_lookup(struct fsssd_client *client, uint64_t parent_ino, const char
 }
 
 int
+fsssd_client_create_file(struct fsssd_client *client, uint64_t parent_ino, const char *name,
+			 uint16_t mode, uint64_t *ino, struct fsssd_attr *attr)
+{
+	struct fsssd_request req = {};
+	struct fsssd_response rsp = {};
+	int rc;
+
+	if (client == NULL || name == NULL || ino == NULL || attr == NULL) {
+		return -EINVAL;
+	}
+
+	req.opcode = fsssd_cmd_nfs_create;
+	req.handle = parent_ino;
+	req.name = name;
+	req.mode = mode;
+	rc = fsssd_transport_submit(client->transport, &req, &rsp);
+	if (rc != 0) {
+		return rc;
+	}
+
+	*ino = rsp.result;
+	fsssd_attr_from_rsp(attr, *ino);
+
+	return 0;
+}
+
+int
 fsssd_client_statfs(struct fsssd_client *client, uint64_t ino, struct fsssd_statfs *statfs)
 {
 	struct fsssd_request req = {};

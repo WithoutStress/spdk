@@ -303,6 +303,45 @@ fsssd_open(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 }
 
 static int
+fsssd_create(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
+{
+	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct spdk_fsdev_file_object *parent = fsdev_io->u_in.create.parent_fobject;
+	struct fsssd_attr attr;
+	uint64_t ino;
+	int rc;
+
+	if (parent == NULL) {
+		parent = vfsdev->root;
+	}
+
+	if (parent == NULL || fsdev_io->u_in.create.name == NULL) {
+		return -EINVAL;
+	}
+
+	rc = fsssd_client_create_file(vfsdev->client, parent->ino, fsdev_io->u_in.create.name,
+				      fsdev_io->u_in.create.mode, &ino, &attr);
+	if (rc != 0) {
+		return rc;
+	}
+
+	fsdev_io->u_out.create.fobject = fsssd_file_object_create(parent, ino);
+	if (fsdev_io->u_out.create.fobject == NULL) {
+		return -ENOMEM;
+	}
+
+	fsdev_io->u_out.create.fhandle = fsssd_file_handle_create(fsdev_io->u_out.create.fobject);
+	if (fsdev_io->u_out.create.fhandle == NULL) {
+		fsssd_file_object_unref(fsdev_io->u_out.create.fobject, 1);
+		return -ENOMEM;
+	}
+
+	fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.create.attr);
+
+	return 0;
+}
+
+static int
 fsssd_release(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct spdk_fsdev_file_handle *fhandle = fsdev_io->u_in.release.fhandle;
@@ -472,6 +511,7 @@ static fsdev_op_handler_func fsssd_handlers[] = {
 	[SPDK_FSDEV_IO_FORGET] = fsssd_forget,
 	[SPDK_FSDEV_IO_GETATTR] = fsssd_getattr,
 	[SPDK_FSDEV_IO_OPEN] = fsssd_open,
+	[SPDK_FSDEV_IO_CREATE] = fsssd_create,
 	[SPDK_FSDEV_IO_READ] = fsssd_read,
 	[SPDK_FSDEV_IO_WRITE] = fsssd_write,
 	[SPDK_FSDEV_IO_STATFS] = fsssd_statfs,

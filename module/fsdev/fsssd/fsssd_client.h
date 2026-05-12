@@ -45,6 +45,8 @@ int fsssd_client_mount(struct fsssd_client *client, uint64_t *root_ino, struct f
 int fsssd_client_getattr(struct fsssd_client *client, uint64_t ino, struct fsssd_attr *attr);
 int fsssd_client_lookup(struct fsssd_client *client, uint64_t parent_ino, const char *name,
 			uint64_t *ino, struct fsssd_attr *attr);
+int fsssd_client_create_file(struct fsssd_client *client, uint64_t parent_ino, const char *name,
+			     uint16_t mode, uint64_t *ino, struct fsssd_attr *attr);
 int fsssd_client_statfs(struct fsssd_client *client, uint64_t ino, struct fsssd_statfs *statfs);
 int fsssd_client_read(struct fsssd_client *client, uint64_t ino, uint64_t offset, size_t size,
 		      struct iovec *iov, uint32_t iovcnt, uint32_t *data_size);
