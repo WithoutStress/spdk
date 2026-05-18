@@ -5,6 +5,7 @@
 #include "fsssd_proto.h"
 
 struct fsssd_transport;
+struct fsssd_transport_channel;
 
 struct fsssd_transport_opts {
 	const char *name;
@@ -30,10 +31,20 @@ struct fsssd_response {
 	uint32_t data_size;
 };
 
+typedef void (*fsssd_transport_complete_cb)(void *cb_arg, int status,
+		const struct fsssd_response *rsp);
+
 struct fsssd_transport *fsssd_transport_create(const struct fsssd_transport_opts *opts);
 void fsssd_transport_destroy(struct fsssd_transport *transport);
+struct fsssd_transport_channel *fsssd_transport_channel_create(struct fsssd_transport *transport);
+void fsssd_transport_channel_destroy(struct fsssd_transport_channel *channel);
+int fsssd_transport_channel_poll(struct fsssd_transport_channel *channel);
 int fsssd_transport_submit(struct fsssd_transport *transport, const struct fsssd_request *req,
 			   struct fsssd_response *rsp);
+int fsssd_transport_submit_async(struct fsssd_transport *transport,
+				 struct fsssd_transport_channel *channel,
+				 const struct fsssd_request *req,
+				 fsssd_transport_complete_cb cb_fn, void *cb_arg);
 const char *fsssd_transport_get_name(const struct fsssd_transport *transport);
 const char *fsssd_transport_get_device(const struct fsssd_transport *transport);
 uint32_t fsssd_transport_get_nsid(const struct fsssd_transport *transport);

@@ -12,8 +12,12 @@ struct fsssd_client {
 	bool writeback_cache_enabled;
 };
 
-static void
-fsssd_attr_from_rsp(struct fsssd_attr *attr, uint64_t ino)
+struct fsssd_client_channel {
+	struct fsssd_transport_channel *transport_channel;
+};
+
+void
+fsssd_client_attr_from_result(struct fsssd_attr *attr, uint64_t ino)
 {
 	memset(attr, 0, sizeof(*attr));
 	attr->ino = ino;
@@ -22,8 +26,9 @@ fsssd_attr_from_rsp(struct fsssd_attr *attr, uint64_t ino)
 	attr->blksize = 4096;
 }
 
-static void
-fsssd_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fattr *wire, uint64_t ino)
+void
+fsssd_client_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fattr *wire,
+			    uint64_t ino)
 {
 	memset(attr, 0, sizeof(*attr));
 	attr->ino = wire->fileid ? wire->fileid : ino;
@@ -39,8 +44,8 @@ fsssd_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fattr *wire
 	attr->blksize = FSSSD_NFS_PAGE_SIZE;
 }
 
-static void
-fsssd_statfs_from_wire(struct fsssd_statfs *statfs, const struct fsssd_nfs_fsstat *wire)
+void
+fsssd_client_statfs_from_wire(struct fsssd_statfs *statfs, const struct fsssd_nfs_fsstat *wire)
 {
 	memset(statfs, 0, sizeof(*statfs));
 	statfs->blocks = wire->tbytes / FSSSD_NFS_PAGE_SIZE;
@@ -94,6 +99,63 @@ fsssd_client_destroy(struct fsssd_client *client)
 	free(client);
 }
 
+struct fsssd_client_channel *
+fsssd_client_channel_create(struct fsssd_client *client)
+{
+	struct fsssd_client_channel *channel;
+
+	if (client == NULL) {
+		return NULL;
+	}
+
+	channel = calloc(1, sizeof(*channel));
+	if (channel == NULL) {
+		return NULL;
+	}
+
+	channel->transport_channel = fsssd_transport_channel_create(client->transport);
+	if (channel->transport_channel == NULL) {
+		free(channel);
+		return NULL;
+	}
+
+	return channel;
+}
+
+void
+fsssd_client_channel_destroy(struct fsssd_client_channel *channel)
+{
+	if (channel == NULL) {
+		return;
+	}
+
+	fsssd_transport_channel_destroy(channel->transport_channel);
+	free(channel);
+}
+
+int
+fsssd_client_channel_poll(struct fsssd_client_channel *channel)
+{
+	if (channel == NULL) {
+		return -EINVAL;
+	}
+
+	return fsssd_transport_channel_poll(channel->transport_channel);
+}
+
+int
+fsssd_client_submit_async(struct fsssd_client *client, struct fsssd_client_channel *channel,
+			  const struct fsssd_request *req,
+			  fsssd_transport_complete_cb cb_fn, void *cb_arg)
+{
+	if (client == NULL || channel == NULL) {
+		return -EINVAL;
+	}
+
+	return fsssd_transport_submit_async(client->transport, channel->transport_channel, req,
+					   cb_fn, cb_arg);
+}
+
 int
 fsssd_client_mount(struct fsssd_client *client, uint64_t *root_ino, struct fsssd_attr *attr)
 {
@@ -112,7 +174,7 @@ fsssd_client_mount(struct fsssd_client *client, uint64_t *root_ino, struct fsssd
 	}
 
 	*root_ino = rsp.result ? rsp.result : 1;
-	fsssd_attr_from_rsp(attr, *root_ino);
+	fsssd_client_attr_from_result(attr, *root_ino);
 	attr->mode = S_IFDIR | 0755;
 
 	return 0;
@@ -139,7 +201,7 @@ fsssd_client_getattr(struct fsssd_client *client, uint64_t ino, struct fsssd_att
 		return rc;
 	}
 
-	fsssd_attr_from_wire(attr, &wire_attr, ino);
+	fsssd_client_attr_from_wire(attr, &wire_attr, ino);
 
 	return 0;
 }
@@ -165,7 +227,7 @@ fsssd_client_lookup(struct fsssd_client *client, uint64_t parent_ino, const char
 	}
 
 	*ino = rsp.result;
-	fsssd_attr_from_rsp(attr, *ino);
+	fsssd_client_attr_from_result(attr, *ino);
 
 	return 0;
 }
@@ -192,7 +254,7 @@ fsssd_client_create_file(struct fsssd_client *client, uint64_t parent_ino, const
 	}
 
 	*ino = rsp.result;
-	fsssd_attr_from_rsp(attr, *ino);
+	fsssd_client_attr_from_result(attr, *ino);
 
 	return 0;
 }
@@ -218,7 +280,7 @@ fsssd_client_statfs(struct fsssd_client *client, uint64_t ino, struct fsssd_stat
 		return rc;
 	}
 
-	fsssd_statfs_from_wire(statfs, &wire_statfs);
+	fsssd_client_statfs_from_wire(statfs, &wire_statfs);
 
 	return 0;
 }

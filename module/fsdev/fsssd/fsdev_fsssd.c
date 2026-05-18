@@ -11,6 +11,11 @@
 #include "fsssd_client.h"
 
 #define FSSSD_DEFAULT_MAX_WRITE 0x00020000
+#define IO_STATUS_ASYNC INT_MIN
+
+#ifndef UNUSED
+#define UNUSED(x) (void)(x)
+#endif
 
 struct spdk_fsdev_file_object {
 	uint64_t ino;
@@ -35,11 +40,20 @@ struct fsssd_fsdev {
 };
 
 struct fsssd_fsdev_io {
-	int unused;
+	struct spdk_fsdev_file_object *parent;
+	struct fsssd_nfs_fattr wire_attr;
+	struct fsssd_nfs_fsstat wire_statfs;
+};
+
+struct fsssd_channel_entry {
+	struct fsssd_fsdev *vfsdev;
+	struct fsssd_client_channel *client_channel;
+	TAILQ_ENTRY(fsssd_channel_entry) link;
 };
 
 struct fsssd_io_channel {
-	int unused;
+	struct spdk_poller *poller;
+	TAILQ_HEAD(, fsssd_channel_entry) channels;
 };
 
 static TAILQ_HEAD(, fsssd_fsdev) g_fsssd_fsdev_head = TAILQ_HEAD_INITIALIZER(g_fsssd_fsdev_head);
@@ -48,6 +62,12 @@ static inline struct fsssd_fsdev *
 fsdev_to_fsssd(struct spdk_fsdev *fsdev)
 {
 	return SPDK_CONTAINEROF(fsdev, struct fsssd_fsdev, fsdev);
+}
+
+static inline struct fsssd_fsdev_io *
+fsdev_to_fsssd_io(const struct spdk_fsdev_io *fsdev_io)
+{
+	return (struct fsssd_fsdev_io *)fsdev_io->driver_ctx;
 }
 
 static struct spdk_fsdev_file_object *
@@ -175,33 +195,108 @@ fsssd_statfs_to_fsdev(const struct fsssd_statfs *src, struct spdk_fsdev_file_sta
 	dst->frsize = src->frsize;
 }
 
+static struct fsssd_client_channel *
+fsssd_get_client_channel(struct spdk_io_channel *ch, struct fsssd_fsdev *vfsdev)
+{
+	struct fsssd_io_channel *fch = spdk_io_channel_get_ctx(ch);
+	struct fsssd_channel_entry *entry;
+
+	TAILQ_FOREACH(entry, &fch->channels, link) {
+		if (entry->vfsdev == vfsdev) {
+			return entry->client_channel;
+		}
+	}
+
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL) {
+		return NULL;
+	}
+
+	entry->vfsdev = vfsdev;
+	entry->client_channel = fsssd_client_channel_create(vfsdev->client);
+	if (entry->client_channel == NULL) {
+		free(entry);
+		return NULL;
+	}
+
+	TAILQ_INSERT_TAIL(&fch->channels, entry, link);
+	return entry->client_channel;
+}
+
+static void
+fsssd_remove_client_channel(struct fsssd_io_channel *fch, struct fsssd_fsdev *vfsdev)
+{
+	struct fsssd_channel_entry *entry, *tmp;
+
+	TAILQ_FOREACH_SAFE(entry, &fch->channels, link, tmp) {
+		if (entry->vfsdev == vfsdev) {
+			TAILQ_REMOVE(&fch->channels, entry, link);
+			fsssd_client_channel_destroy(entry->client_channel);
+			free(entry);
+			return;
+		}
+	}
+}
+
+static int
+fsssd_submit_async(struct spdk_io_channel *ch, struct fsssd_fsdev *vfsdev,
+		   const struct fsssd_request *req,
+		   fsssd_transport_complete_cb cb_fn, struct spdk_fsdev_io *fsdev_io)
+{
+	struct fsssd_client_channel *client_channel;
+
+	client_channel = fsssd_get_client_channel(ch, vfsdev);
+	if (client_channel == NULL) {
+		return -ENOMEM;
+	}
+
+	return fsssd_client_submit_async(vfsdev->client, client_channel, req, cb_fn, fsdev_io);
+}
+
+static void
+fsssd_mount_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	uint64_t root_ino;
+
+	if (status == 0) {
+		root_ino = rsp->result ? rsp->result : 1;
+
+		if (vfsdev->root == NULL) {
+			vfsdev->root = fsssd_file_object_create(NULL, root_ino);
+			if (vfsdev->root == NULL) {
+				status = -ENOMEM;
+			}
+		}
+	}
+
+	if (status == 0) {
+		fsdev_io->u_out.mount.opts = fsdev_io->u_in.mount.opts;
+		fsdev_io->u_out.mount.opts.max_write = vfsdev->mount_opts.max_write;
+		fsdev_io->u_out.mount.opts.writeback_cache_enabled =
+			vfsdev->mount_opts.writeback_cache_enabled;
+		fsssd_file_object_ref(vfsdev->root);
+		fsdev_io->u_out.mount.root_fobject = vfsdev->root;
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
 static int
 fsssd_mount(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
-	struct fsssd_attr attr;
-	uint64_t root_ino;
+	struct fsssd_request req = {};
 	int rc;
 
-	rc = fsssd_client_mount(vfsdev->client, &root_ino, &attr);
+	req.opcode = fsssd_cmd_nfs_mnt;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_mount_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
 
-	if (vfsdev->root == NULL) {
-		vfsdev->root = fsssd_file_object_create(NULL, root_ino);
-		if (vfsdev->root == NULL) {
-			return -ENOMEM;
-		}
-	}
-
-	fsdev_io->u_out.mount.opts = fsdev_io->u_in.mount.opts;
-	fsdev_io->u_out.mount.opts.max_write = vfsdev->mount_opts.max_write;
-	fsdev_io->u_out.mount.opts.writeback_cache_enabled = vfsdev->mount_opts.writeback_cache_enabled;
-	fsssd_file_object_ref(vfsdev->root);
-	fsdev_io->u_out.mount.root_fobject = vfsdev->root;
-
-	return 0;
+	return IO_STATUS_ASYNC;
 }
 
 static int
@@ -217,13 +312,35 @@ fsssd_umount(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	return 0;
 }
 
+static void
+fsssd_lookup_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct fsssd_attr attr;
+
+	if (status == 0) {
+		fsdev_io->u_out.lookup.fobject = fsssd_file_object_create(fsssd_io->parent, rsp->result);
+		if (fsdev_io->u_out.lookup.fobject == NULL) {
+			status = -ENOMEM;
+		}
+	}
+
+	if (status == 0) {
+		fsssd_client_attr_from_result(&attr, rsp->result);
+		fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.lookup.attr);
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
 static int
 fsssd_lookup(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
 	struct spdk_fsdev_file_object *parent = fsdev_io->u_in.lookup.parent_fobject;
-	struct fsssd_attr attr;
-	uint64_t ino;
+	struct fsssd_request req = {};
 	int rc;
 
 	if (parent == NULL) {
@@ -234,19 +351,16 @@ fsssd_lookup(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 		return -EINVAL;
 	}
 
-	rc = fsssd_client_lookup(vfsdev->client, parent->ino, fsdev_io->u_in.lookup.name, &ino, &attr);
+	fsssd_io->parent = parent;
+	req.opcode = fsssd_cmd_nfs_lookup;
+	req.handle = parent->ino;
+	req.name = fsdev_io->u_in.lookup.name;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_lookup_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
 
-	fsdev_io->u_out.lookup.fobject = fsssd_file_object_create(parent, ino);
-	if (fsdev_io->u_out.lookup.fobject == NULL) {
-		return -ENOMEM;
-	}
-
-	fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.lookup.attr);
-
-	return 0;
+	return IO_STATUS_ASYNC;
 }
 
 static int
@@ -263,26 +377,48 @@ fsssd_forget(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	return 0;
 }
 
+static void
+fsssd_getattr_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct spdk_fsdev_file_object *fobject = fsdev_io->u_in.getattr.fobject;
+	struct fsssd_attr attr;
+
+	UNUSED(rsp);
+
+	if (status == 0) {
+		fsssd_client_attr_from_wire(&attr, &fsssd_io->wire_attr, fobject->ino);
+		fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.getattr.attr);
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
 static int
 fsssd_getattr(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
 	struct spdk_fsdev_file_object *fobject = fsdev_io->u_in.getattr.fobject;
-	struct fsssd_attr attr;
+	struct fsssd_request req = {};
 	int rc;
 
 	if (fobject == NULL) {
 		return -EINVAL;
 	}
 
-	rc = fsssd_client_getattr(vfsdev->client, fobject->ino, &attr);
+	memset(&fsssd_io->wire_attr, 0, sizeof(fsssd_io->wire_attr));
+	req.opcode = fsssd_cmd_nfs_getattr;
+	req.handle = fobject->ino;
+	req.payload = &fsssd_io->wire_attr;
+	req.payload_len = sizeof(fsssd_io->wire_attr);
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_getattr_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
 
-	fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.getattr.attr);
-
-	return 0;
+	return IO_STATUS_ASYNC;
 }
 
 static int
@@ -302,13 +438,43 @@ fsssd_open(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	return 0;
 }
 
+static void
+fsssd_create_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct fsssd_attr attr;
+
+	if (status == 0) {
+		fsdev_io->u_out.create.fobject = fsssd_file_object_create(fsssd_io->parent, rsp->result);
+		if (fsdev_io->u_out.create.fobject == NULL) {
+			status = -ENOMEM;
+		}
+	}
+
+	if (status == 0) {
+		fsdev_io->u_out.create.fhandle = fsssd_file_handle_create(fsdev_io->u_out.create.fobject);
+		if (fsdev_io->u_out.create.fhandle == NULL) {
+			fsssd_file_object_unref(fsdev_io->u_out.create.fobject, 1);
+			status = -ENOMEM;
+		}
+	}
+
+	if (status == 0) {
+		fsssd_client_attr_from_result(&attr, rsp->result);
+		fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.create.attr);
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
 static int
 fsssd_create(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
 	struct spdk_fsdev_file_object *parent = fsdev_io->u_in.create.parent_fobject;
-	struct fsssd_attr attr;
-	uint64_t ino;
+	struct fsssd_request req = {};
 	int rc;
 
 	if (parent == NULL) {
@@ -319,26 +485,17 @@ fsssd_create(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 		return -EINVAL;
 	}
 
-	rc = fsssd_client_create_file(vfsdev->client, parent->ino, fsdev_io->u_in.create.name,
-				      fsdev_io->u_in.create.mode, &ino, &attr);
+	fsssd_io->parent = parent;
+	req.opcode = fsssd_cmd_nfs_create;
+	req.handle = parent->ino;
+	req.name = fsdev_io->u_in.create.name;
+	req.mode = fsdev_io->u_in.create.mode;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_create_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
 
-	fsdev_io->u_out.create.fobject = fsssd_file_object_create(parent, ino);
-	if (fsdev_io->u_out.create.fobject == NULL) {
-		return -ENOMEM;
-	}
-
-	fsdev_io->u_out.create.fhandle = fsssd_file_handle_create(fsdev_io->u_out.create.fobject);
-	if (fsdev_io->u_out.create.fhandle == NULL) {
-		fsssd_file_object_unref(fsdev_io->u_out.create.fobject, 1);
-		return -ENOMEM;
-	}
-
-	fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.create.attr);
-
-	return 0;
+	return IO_STATUS_ASYNC;
 }
 
 static int
@@ -355,28 +512,54 @@ fsssd_release(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	return 0;
 }
 
+static void
+fsssd_read_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+
+	if (status == 0) {
+		fsdev_io->u_out.read.data_size = rsp->data_size;
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
 static int
 fsssd_read(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
 	struct spdk_fsdev_file_object *fobject = fsdev_io->u_in.read.fobject;
-	uint32_t data_size;
+	struct fsssd_request req = {};
 	int rc;
 
 	if (fobject == NULL || fsdev_io->u_in.read.fhandle == NULL) {
 		return -EINVAL;
 	}
 
-	rc = fsssd_client_read(vfsdev->client, fobject->ino, fsdev_io->u_in.read.offs,
-			       fsdev_io->u_in.read.size, fsdev_io->u_in.read.iov,
-			       fsdev_io->u_in.read.iovcnt, &data_size);
+	req.opcode = fsssd_cmd_nfs_read;
+	req.handle = fobject->ino;
+	req.offset = fsdev_io->u_in.read.offs;
+	req.size = fsdev_io->u_in.read.size;
+	req.iov = fsdev_io->u_in.read.iov;
+	req.iovcnt = fsdev_io->u_in.read.iovcnt;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_read_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
 
-	fsdev_io->u_out.read.data_size = data_size;
+	return IO_STATUS_ASYNC;
+}
 
-	return 0;
+static void
+fsssd_write_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+
+	if (status == 0) {
+		fsdev_io->u_out.write.data_size = rsp->data_size;
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
 }
 
 static int
@@ -384,45 +567,68 @@ fsssd_write(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
 	struct spdk_fsdev_file_object *fobject = fsdev_io->u_in.write.fobject;
-	uint32_t data_size;
+	struct fsssd_request req = {};
 	int rc;
 
 	if (fobject == NULL || fsdev_io->u_in.write.fhandle == NULL) {
 		return -EINVAL;
 	}
 
-	rc = fsssd_client_write(vfsdev->client, fobject->ino, fsdev_io->u_in.write.offs,
-				fsdev_io->u_in.write.size, fsdev_io->u_in.write.iov,
-				fsdev_io->u_in.write.iovcnt, &data_size);
+	req.opcode = fsssd_cmd_nfs_write;
+	req.handle = fobject->ino;
+	req.offset = fsdev_io->u_in.write.offs;
+	req.size = fsdev_io->u_in.write.size;
+	req.iov = (struct iovec *)fsdev_io->u_in.write.iov;
+	req.iovcnt = fsdev_io->u_in.write.iovcnt;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_write_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
 
-	fsdev_io->u_out.write.data_size = data_size;
+	return IO_STATUS_ASYNC;
+}
 
-	return 0;
+static void
+fsssd_statfs_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct fsssd_statfs statfs;
+
+	UNUSED(rsp);
+
+	if (status == 0) {
+		fsssd_client_statfs_from_wire(&statfs, &fsssd_io->wire_statfs);
+		fsssd_statfs_to_fsdev(&statfs, &fsdev_io->u_out.statfs.statfs);
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
 }
 
 static int
 fsssd_statfs(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
 	struct spdk_fsdev_file_object *fobject = fsdev_io->u_in.statfs.fobject;
-	struct fsssd_statfs statfs;
+	struct fsssd_request req = {};
 	int rc;
 
 	if (fobject == NULL) {
 		return -EINVAL;
 	}
 
-	rc = fsssd_client_statfs(vfsdev->client, fobject->ino, &statfs);
+	memset(&fsssd_io->wire_statfs, 0, sizeof(fsssd_io->wire_statfs));
+	req.opcode = fsssd_cmd_nfs_fsstat;
+	req.handle = fobject->ino;
+	req.payload = &fsssd_io->wire_statfs;
+	req.payload_len = sizeof(fsssd_io->wire_statfs);
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_statfs_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
 
-	fsssd_statfs_to_fsdev(&statfs, &fsdev_io->u_out.statfs.statfs);
-
-	return 0;
+	return IO_STATUS_ASYNC;
 }
 
 static int
@@ -438,14 +644,50 @@ fsssd_unsupported(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 }
 
 static int
+fsssd_channel_poll(void *arg)
+{
+	struct fsssd_io_channel *fch = arg;
+	struct fsssd_channel_entry *entry;
+	int rc;
+	int work_done = 0;
+
+	TAILQ_FOREACH(entry, &fch->channels, link) {
+		rc = fsssd_client_channel_poll(entry->client_channel);
+		if (rc > 0) {
+			work_done += rc;
+		}
+	}
+
+	return work_done ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+static int
 fsssd_channel_create_cb(void *io_device, void *ctx_buf)
 {
+	struct fsssd_io_channel *fch = ctx_buf;
+
+	TAILQ_INIT(&fch->channels);
+	fch->poller = SPDK_POLLER_REGISTER(fsssd_channel_poll, fch, 0);
+	if (fch->poller == NULL) {
+		return -ENOMEM;
+	}
+
 	return 0;
 }
 
 static void
 fsssd_channel_destroy_cb(void *io_device, void *ctx_buf)
 {
+	struct fsssd_io_channel *fch = ctx_buf;
+	struct fsssd_channel_entry *entry;
+
+	spdk_poller_unregister(&fch->poller);
+	while (!TAILQ_EMPTY(&fch->channels)) {
+		entry = TAILQ_FIRST(&fch->channels);
+		TAILQ_REMOVE(&fch->channels, entry, link);
+		fsssd_client_channel_destroy(entry->client_channel);
+		free(entry);
+	}
 }
 
 static int
@@ -483,12 +725,20 @@ static struct spdk_fsdev_module fsssd_fsdev_module = {
 
 SPDK_FSDEV_MODULE_REGISTER(fsssd, &fsssd_fsdev_module);
 
-static int
-fsdev_fsssd_destruct(void *ctx)
+static void
+fsssd_remove_client_channel_iter(struct spdk_io_channel_iter *i)
 {
-	struct fsssd_fsdev *vfsdev = ctx;
+	struct fsssd_fsdev *vfsdev = spdk_io_channel_iter_get_ctx(i);
+	struct fsssd_io_channel *fch = spdk_io_channel_get_ctx(spdk_io_channel_iter_get_channel(i));
 
-	TAILQ_REMOVE(&g_fsssd_fsdev_head, vfsdev, tailq);
+	fsssd_remove_client_channel(fch, vfsdev);
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+fsssd_remove_client_channel_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct fsssd_fsdev *vfsdev = spdk_io_channel_iter_get_ctx(i);
 
 	if (vfsdev->root != NULL) {
 		fsssd_file_object_free_leafs(vfsdev->root);
@@ -496,10 +746,21 @@ fsdev_fsssd_destruct(void *ctx)
 	}
 
 	fsssd_client_destroy(vfsdev->client);
+	spdk_fsdev_destruct_done(&vfsdev->fsdev, status);
 	free(vfsdev->fsdev.name);
 	free(vfsdev);
+}
 
-	return 0;
+static int
+fsdev_fsssd_destruct(void *ctx)
+{
+	struct fsssd_fsdev *vfsdev = ctx;
+
+	TAILQ_REMOVE(&g_fsssd_fsdev_head, vfsdev, tailq);
+	spdk_for_each_channel(&g_fsssd_fsdev_head, fsssd_remove_client_channel_iter, vfsdev,
+			      fsssd_remove_client_channel_done);
+
+	return 1;
 }
 
 typedef int (*fsdev_op_handler_func)(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io);
@@ -533,7 +794,9 @@ fsdev_fsssd_submit_request(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsd
 		status = fsssd_handlers[type](ch, fsdev_io);
 	}
 
-	spdk_fsdev_io_complete(fsdev_io, status);
+	if (status != IO_STATUS_ASYNC) {
+		spdk_fsdev_io_complete(fsdev_io, status);
+	}
 }
 
 static struct spdk_io_channel *

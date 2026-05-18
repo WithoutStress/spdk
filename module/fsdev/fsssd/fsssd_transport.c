@@ -8,6 +8,7 @@
 
 #define FSSSD_PRP_LIST_ENTRIES (FSSSD_NFS_PAGE_SIZE / sizeof(uint64_t))
 #define FSSSD_PRP_MAX_ENTRIES (FSSSD_PRP_LIST_ENTRIES + 1)
+#define FSSSD_NFS_READ_COUNT_MASK 0x7fffffffU
 
 struct fsssd_transport {
 	char *name;
@@ -16,6 +17,11 @@ struct fsssd_transport {
 	struct spdk_nvme_transport_id trid;
 	struct spdk_nvme_ctrlr *ctrlr;
 	struct spdk_nvme_ns *ns;
+	struct spdk_nvme_qpair *qpair;
+};
+
+struct fsssd_transport_channel {
+	struct fsssd_transport *transport;
 	struct spdk_nvme_qpair *qpair;
 };
 
@@ -36,6 +42,14 @@ struct fsssd_transport_payload {
 	bool copy_out;
 	bool iov_copy_out;
 	bool dma_allocated;
+};
+
+struct fsssd_transport_async_request {
+	struct fsssd_transport_payload payload;
+	struct fsssd_response rsp;
+	fsssd_transport_complete_cb cb_fn;
+	void *cb_arg;
+	enum fsssd_nfs_opcode opcode;
 };
 
 static int
@@ -123,6 +137,53 @@ fsssd_transport_destroy(struct fsssd_transport *transport)
 	free(transport);
 }
 
+struct fsssd_transport_channel *
+fsssd_transport_channel_create(struct fsssd_transport *transport)
+{
+	struct fsssd_transport_channel *channel;
+
+	if (transport == NULL) {
+		return NULL;
+	}
+
+	channel = calloc(1, sizeof(*channel));
+	if (channel == NULL) {
+		return NULL;
+	}
+
+	channel->transport = transport;
+	channel->qpair = spdk_nvme_ctrlr_alloc_io_qpair(transport->ctrlr, NULL, 0);
+	if (channel->qpair == NULL) {
+		free(channel);
+		return NULL;
+	}
+
+	return channel;
+}
+
+void
+fsssd_transport_channel_destroy(struct fsssd_transport_channel *channel)
+{
+	if (channel == NULL) {
+		return;
+	}
+
+	if (channel->qpair != NULL) {
+		spdk_nvme_ctrlr_free_io_qpair(channel->qpair);
+	}
+	free(channel);
+}
+
+int
+fsssd_transport_channel_poll(struct fsssd_transport_channel *channel)
+{
+	if (channel == NULL || channel->qpair == NULL) {
+		return -EINVAL;
+	}
+
+	return spdk_nvme_qpair_process_completions(channel->qpair, 0);
+}
+
 static void
 fsssd_transport_nvme_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 {
@@ -130,6 +191,16 @@ fsssd_transport_nvme_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 
 	completion->cpl = *cpl;
 	completion->done = true;
+}
+
+static uint32_t
+fsssd_transport_data_size(enum fsssd_nfs_opcode opcode, uint32_t cdw0)
+{
+	if (opcode == fsssd_cmd_nfs_read) {
+		return cdw0 & FSSSD_NFS_READ_COUNT_MASK;
+	}
+
+	return cdw0;
 }
 
 static int
@@ -517,13 +588,57 @@ fsssd_transport_build_cmd(struct fsssd_transport *transport, const struct fsssd_
 	}
 }
 
+static int
+fsssd_transport_submit_nvme(struct fsssd_transport *transport, struct spdk_nvme_qpair *qpair,
+			    const struct fsssd_request *req,
+			    struct fsssd_transport_payload *payload,
+			    spdk_nvme_cmd_cb cb_fn, void *cb_arg)
+{
+	struct spdk_nvme_cmd cmd = {};
+	int rc;
+
+	fsssd_transport_build_cmd(transport, req, &cmd);
+	if (payload->len != 0 && transport->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) { /* TODO: it may not support NVMe-oF */
+		rc = fsssd_transport_build_prps(payload, &cmd);
+		if (rc == -EAGAIN) {
+			SPDK_NOTICELOG("fsssd prp path: fallback bounce opcode=%u len=%u iovcnt=%u\n",
+				       req->opcode, payload->len, payload->iovcnt);
+			rc = fsssd_transport_use_bounce(req, payload);
+			if (rc == 0) {
+				rc = fsssd_transport_build_prps(payload, &cmd);
+				if (rc == 0) {
+					SPDK_NOTICELOG("fsssd prp path: bounce prp opcode=%u len=%u\n",
+						       req->opcode, payload->len);
+				}
+			}
+		} else if (rc == 0) {
+			SPDK_NOTICELOG("fsssd prp path: zero-copy opcode=%u len=%u iovcnt=%u\n",
+				       req->opcode, payload->len, payload->iovcnt);
+		}
+		if (rc != 0) {
+			return rc;
+		}
+		return spdk_nvme_ctrlr_io_cmd_raw_no_payload_build(transport->ctrlr, qpair,
+				&cmd, cb_fn, cb_arg);
+	}
+
+	if (payload->len != 0 && payload->buf == NULL) {
+		rc = fsssd_transport_use_bounce(req, payload);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	return spdk_nvme_ctrlr_cmd_io_raw(transport->ctrlr, qpair, &cmd, payload->buf,
+					  payload->len, cb_fn, cb_arg);
+}
+
 int
 fsssd_transport_submit(struct fsssd_transport *transport, const struct fsssd_request *req,
 		       struct fsssd_response *rsp)
 {
 	struct fsssd_nvme_completion completion = {};
 	struct fsssd_transport_payload payload = {};
-	struct spdk_nvme_cmd cmd = {};
 	int rc;
 
 	if (transport == NULL || req == NULL || rsp == NULL) {
@@ -536,41 +651,8 @@ fsssd_transport_submit(struct fsssd_transport *transport, const struct fsssd_req
 		return rc;
 	}
 
-	fsssd_transport_build_cmd(transport, req, &cmd);
-	if (payload.len != 0 && transport->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) { /* TODO: it may not support NVMe-oF */
-		rc = fsssd_transport_build_prps(&payload, &cmd);
-		if (rc == -EAGAIN) {
-			SPDK_NOTICELOG("fsssd prp path: fallback bounce opcode=%u len=%u iovcnt=%u\n",
-				       req->opcode, payload.len, payload.iovcnt);
-			rc = fsssd_transport_use_bounce(req, &payload);
-			if (rc == 0) {
-				rc = fsssd_transport_build_prps(&payload, &cmd);
-				if (rc == 0) {
-					SPDK_NOTICELOG("fsssd prp path: bounce prp opcode=%u len=%u\n",
-						       req->opcode, payload.len);
-				}
-			}
-		} else if (rc == 0) {
-			SPDK_NOTICELOG("fsssd prp path: zero-copy opcode=%u len=%u iovcnt=%u\n",
-				       req->opcode, payload.len, payload.iovcnt);
-		}
-		if (rc != 0) {
-			fsssd_transport_release_payload(&payload, false);
-			return rc;
-		}
-		rc = spdk_nvme_ctrlr_io_cmd_raw_no_payload_build(transport->ctrlr, transport->qpair,
-				&cmd, fsssd_transport_nvme_complete, &completion);
-	} else {
-		if (payload.len != 0 && payload.buf == NULL) {
-			rc = fsssd_transport_use_bounce(req, &payload);
-			if (rc != 0) {
-				fsssd_transport_release_payload(&payload, false);
-				return rc;
-			}
-		}
-		rc = spdk_nvme_ctrlr_cmd_io_raw(transport->ctrlr, transport->qpair, &cmd, payload.buf,
-						payload.len, fsssd_transport_nvme_complete, &completion);
-	}
+	rc = fsssd_transport_submit_nvme(transport, transport->qpair, req, &payload,
+					 fsssd_transport_nvme_complete, &completion);
 	if (rc != 0) {
 		fsssd_transport_release_payload(&payload, false);
 		return rc;
@@ -584,7 +666,63 @@ fsssd_transport_submit(struct fsssd_transport *transport, const struct fsssd_req
 	fsssd_transport_release_payload(&payload, true);
 
 	rsp->result = completion.cpl.cdw0 | ((uint64_t)completion.cpl.cdw1 << 32);
-	rsp->data_size = completion.cpl.cdw0;
+	rsp->data_size = fsssd_transport_data_size(req->opcode, completion.cpl.cdw0);
+
+	return 0;
+}
+
+static void
+fsssd_transport_async_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	struct fsssd_transport_async_request *async_req = ctx;
+	int status;
+
+	status = fsssd_transport_status_to_errno(cpl);
+	if (status == 0) {
+		async_req->rsp.result = cpl->cdw0 | ((uint64_t)cpl->cdw1 << 32);
+		async_req->rsp.data_size = fsssd_transport_data_size(async_req->opcode, cpl->cdw0);
+	}
+
+	fsssd_transport_release_payload(&async_req->payload, status == 0);
+	async_req->cb_fn(async_req->cb_arg, status, &async_req->rsp);
+	free(async_req);
+}
+
+int
+fsssd_transport_submit_async(struct fsssd_transport *transport,
+			     struct fsssd_transport_channel *channel,
+			     const struct fsssd_request *req,
+			     fsssd_transport_complete_cb cb_fn, void *cb_arg)
+{
+	struct fsssd_transport_async_request *async_req;
+	int rc;
+
+	if (transport == NULL || channel == NULL || channel->qpair == NULL ||
+	    req == NULL || cb_fn == NULL) {
+		return -EINVAL;
+	}
+
+	async_req = calloc(1, sizeof(*async_req));
+	if (async_req == NULL) {
+		return -ENOMEM;
+	}
+
+	rc = fsssd_transport_prepare_payload(req, &async_req->payload);
+	if (rc != 0) {
+		free(async_req);
+		return rc;
+	}
+
+	async_req->cb_fn = cb_fn;
+	async_req->cb_arg = cb_arg;
+	async_req->opcode = req->opcode;
+	rc = fsssd_transport_submit_nvme(transport, channel->qpair, req, &async_req->payload,
+					 fsssd_transport_async_complete, async_req);
+	if (rc != 0) {
+		fsssd_transport_release_payload(&async_req->payload, false);
+		free(async_req);
+		return rc;
+	}
 
 	return 0;
 }
