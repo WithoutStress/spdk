@@ -8,6 +8,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 DIRS-y += nvme
 DIRS-y += bdev
+DIRS-y += fsdev
 
 .PHONY: all clean $(DIRS-y)
 

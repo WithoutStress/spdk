@@ -9,6 +9,7 @@
 #define FSSSD_PRP_LIST_ENTRIES (FSSSD_NFS_PAGE_SIZE / sizeof(uint64_t))
 #define FSSSD_PRP_MAX_ENTRIES (FSSSD_PRP_LIST_ENTRIES + 1)
 #define FSSSD_NFS_READ_COUNT_MASK 0x7fffffffU
+#define FSSSD_ADMIN_QUEUE_SIZE 256
 
 struct fsssd_transport {
 	char *name;
@@ -72,6 +73,7 @@ fsssd_transport_parse_trid(struct spdk_nvme_transport_id *trid, const char *devi
 struct fsssd_transport *
 fsssd_transport_create(const struct fsssd_transport_opts *opts)
 {
+	struct spdk_nvme_ctrlr_opts ctrlr_opts;
 	struct fsssd_transport *transport;
 	int rc;
 
@@ -98,7 +100,10 @@ fsssd_transport_create(const struct fsssd_transport_opts *opts)
 		return NULL;
 	}
 
-	transport->ctrlr = spdk_nvme_connect(&transport->trid, NULL, 0);
+	spdk_nvme_ctrlr_get_default_ctrlr_opts(&ctrlr_opts, sizeof(ctrlr_opts));
+	ctrlr_opts.admin_queue_size = FSSSD_ADMIN_QUEUE_SIZE;
+
+	transport->ctrlr = spdk_nvme_connect(&transport->trid, &ctrlr_opts, sizeof(ctrlr_opts));
 	if (transport->ctrlr == NULL) {
 		fsssd_transport_destroy(transport);
 		return NULL;
@@ -601,19 +606,19 @@ fsssd_transport_submit_nvme(struct fsssd_transport *transport, struct spdk_nvme_
 	if (payload->len != 0 && transport->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) { /* TODO: it may not support NVMe-oF */
 		rc = fsssd_transport_build_prps(payload, &cmd);
 		if (rc == -EAGAIN) {
-			SPDK_NOTICELOG("fsssd prp path: fallback bounce opcode=%u len=%u iovcnt=%u\n",
-				       req->opcode, payload->len, payload->iovcnt);
+			// SPDK_NOTICELOG("fsssd prp path: fallback bounce opcode=%u len=%u iovcnt=%u\n",
+			// 	       req->opcode, payload->len, payload->iovcnt);
 			rc = fsssd_transport_use_bounce(req, payload);
 			if (rc == 0) {
 				rc = fsssd_transport_build_prps(payload, &cmd);
 				if (rc == 0) {
-					SPDK_NOTICELOG("fsssd prp path: bounce prp opcode=%u len=%u\n",
-						       req->opcode, payload->len);
+					// SPDK_NOTICELOG("fsssd prp path: bounce prp opcode=%u len=%u\n",
+					// 	       req->opcode, payload->len);
 				}
 			}
 		} else if (rc == 0) {
-			SPDK_NOTICELOG("fsssd prp path: zero-copy opcode=%u len=%u iovcnt=%u\n",
-				       req->opcode, payload->len, payload->iovcnt);
+			// SPDK_NOTICELOG("fsssd prp path: zero-copy opcode=%u len=%u iovcnt=%u\n",
+			// 	       req->opcode, payload->len, payload->iovcnt);
 		}
 		if (rc != 0) {
 			return rc;

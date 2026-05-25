@@ -305,7 +305,6 @@ fsssd_umount(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
 
 	if (vfsdev->root != NULL) {
-		fsssd_file_object_free_leafs(vfsdev->root);
 		fsssd_file_object_unref(vfsdev->root, 1);
 	}
 

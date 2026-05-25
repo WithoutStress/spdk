@@ -1,0 +1,18 @@
+{
+  "subsystems": [
+    {
+      "subsystem": "fsdev",
+      "config": [
+        {
+          "method": "fsdev_fsssd_create",
+          "params": {
+            "name": "fsssd0",
+            "device": "trtype:PCIe traddr:0001:10:00.0",
+            "nsid": 1,
+            "enable_writeback_cache": false
+          }
+        }
+      ]
+    }
+  ]
+}
