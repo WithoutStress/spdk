@@ -877,7 +877,13 @@ spdk_fio_setup_lookup_complete(void *cb_arg, struct spdk_io_channel *ch, int sta
 		return;
 	}
 
-	setup->f->real_file_size = attr->size;
+	/*
+	 * FSSSD lookup currently returns an inode-only attr, so size can be 0 even
+	 * when fio has an explicit size/filesize configured for the target.
+	 * TODO: Change NFS_LOOKUP to get response with attr.
+	 */
+	setup->new_file_size = spdk_fio_get_requested_file_size(setup->td, setup->f);
+	setup->f->real_file_size = attr->size != 0 ? attr->size : setup->new_file_size;
 	setup->f->filetype = FIO_TYPE_BLOCK;
 	fio_file_set_size_known(setup->f);
 
