@@ -88,21 +88,6 @@ struct spdk_fio_oat_ctx {
 	int ret;
 };
 
-struct spdk_fio_setup_ctx {
-	struct spdk_fio_oat_ctx		*oat;
-	struct thread_data		*td;
-	struct spdk_fsdev_desc		*desc;
-	struct spdk_io_channel		*ch;
-	struct spdk_fsdev_file_object	*root;
-	struct spdk_fsdev_file_object	*file;
-	struct spdk_fsdev_file_handle	*fhandle;
-	struct fio_file			*f;
-	unsigned int			file_index;
-	uint64_t			unique;
-	uint64_t			new_file_size;
-	int				status;
-};
-
 struct spdk_fio_open_ctx {
 	struct spdk_fio_thread		*fio_thread;
 	struct thread_data		*td;
@@ -777,217 +762,16 @@ spdk_fio_init_spdk_env(struct thread_data *td)
 	return 0;
 }
 
-static void spdk_fio_setup_next_file(struct spdk_fio_setup_ctx *setup);
-static void spdk_fio_setup_finish(struct spdk_fio_setup_ctx *setup);
-
-static void
-spdk_fio_setup_umount_complete(void *cb_arg, struct spdk_io_channel *ch)
-{
-	struct spdk_fio_setup_ctx *setup = cb_arg;
-
-	setup->root = NULL;
-	spdk_fio_setup_finish(setup);
-}
-
-static void
-spdk_fio_setup_forget_complete(void *cb_arg, struct spdk_io_channel *ch, int status)
-{
-	struct spdk_fio_setup_ctx *setup = cb_arg;
-
-	setup->file = NULL;
-	spdk_fio_setup_next_file(setup);
-}
-
-static void
-spdk_fio_setup_release_complete(void *cb_arg, struct spdk_io_channel *ch, int status)
-{
-	struct spdk_fio_setup_ctx *setup = cb_arg;
-	int rc;
-
-	setup->fhandle = NULL;
-	rc = spdk_fsdev_forget(setup->desc, setup->ch, setup->unique++, setup->file, 1,
-			       spdk_fio_setup_forget_complete, setup);
-	if (rc != 0) {
-		setup->status = rc;
-		spdk_fio_setup_finish(setup);
-	}
-}
-
-static void
-spdk_fio_setup_create_complete(void *cb_arg, struct spdk_io_channel *ch, int status,
-			       struct spdk_fsdev_file_object *fobject,
-			       const struct spdk_fsdev_file_attr *attr,
-			       struct spdk_fsdev_file_handle *fhandle)
-{
-	struct spdk_fio_setup_ctx *setup = cb_arg;
-	int rc;
-
-	if (status != 0) {
-		setup->status = status;
-		spdk_fio_setup_finish(setup);
-		return;
-	}
-
-	setup->f->real_file_size = setup->new_file_size;
-	setup->f->filetype = FIO_TYPE_BLOCK;
-	fio_file_set_size_known(setup->f);
-
-	setup->file = fobject;
-	setup->fhandle = fhandle;
-	rc = spdk_fsdev_release(setup->desc, setup->ch, setup->unique++, setup->file,
-				setup->fhandle, spdk_fio_setup_release_complete, setup);
-	if (rc != 0) {
-		setup->status = rc;
-		spdk_fio_setup_finish(setup);
-	}
-}
-
-static void
-spdk_fio_setup_lookup_complete(void *cb_arg, struct spdk_io_channel *ch, int status,
-			       struct spdk_fsdev_file_object *fobject,
-			       const struct spdk_fsdev_file_attr *attr)
-{
-	struct spdk_fio_setup_ctx *setup = cb_arg;
-	struct spdk_fio_options *fio_options = setup->td->eo;
-	int rc;
-
-	if (status == -ENOENT) {
-		setup->new_file_size = spdk_fio_get_requested_file_size(setup->td, setup->f);
-		if (setup->new_file_size == 0) {
-			SPDK_ERRLOG("file %s does not exist; size/filesize is required for create\n",
-				    setup->f->file_name);
-			setup->status = -EINVAL;
-			spdk_fio_setup_finish(setup);
-			return;
-		}
-
-		rc = spdk_fsdev_create(setup->desc, setup->ch, setup->unique++, setup->root,
-				       setup->f->file_name, spdk_fio_get_create_mode(fio_options),
-				       O_RDWR, 0, 0, 0, spdk_fio_setup_create_complete, setup);
-		if (rc != 0) {
-			setup->status = rc;
-			spdk_fio_setup_finish(setup);
-		}
-		return;
-	}
-
-	if (status != 0) {
-		setup->status = status;
-		spdk_fio_setup_finish(setup);
-		return;
-	}
-
-	/*
-	 * FSSSD lookup currently returns an inode-only attr, so size can be 0 even
-	 * when fio has an explicit size/filesize configured for the target.
-	 * TODO: Change NFS_LOOKUP to get response with attr.
-	 */
-	setup->new_file_size = spdk_fio_get_requested_file_size(setup->td, setup->f);
-	setup->f->real_file_size = attr->size != 0 ? attr->size : setup->new_file_size;
-	setup->f->filetype = FIO_TYPE_BLOCK;
-	fio_file_set_size_known(setup->f);
-
-	setup->file = fobject;
-	rc = spdk_fsdev_forget(setup->desc, setup->ch, setup->unique++, setup->file, 1,
-			       spdk_fio_setup_forget_complete, setup);
-	if (rc != 0) {
-		setup->status = rc;
-		spdk_fio_setup_finish(setup);
-	}
-}
-
-static void
-spdk_fio_setup_next_file(struct spdk_fio_setup_ctx *setup)
-{
-	struct fio_file *f;
-	unsigned int i;
-	int rc;
-
-	setup->file = NULL;
-	setup->fhandle = NULL;
-	setup->f = NULL;
-
-	for_each_file(setup->td, f, i) {
-		if (i < setup->file_index) {
-			continue;
-		}
-
-		setup->file_index = i + 1;
-		setup->f = f;
-		if (!spdk_fio_valid_file_name(f->file_name)) {
-			SPDK_ERRLOG("filename must be a single root entry: %s\n", f->file_name);
-			setup->status = -EINVAL;
-			spdk_fio_setup_finish(setup);
-			return;
-		}
-
-		rc = spdk_fsdev_lookup(setup->desc, setup->ch, setup->unique++, setup->root,
-				       f->file_name, spdk_fio_setup_lookup_complete, setup);
-		if (rc != 0) {
-			setup->status = rc;
-			spdk_fio_setup_finish(setup);
-		}
-		return;
-	}
-
-	spdk_fio_setup_finish(setup);
-}
-
-static void
-spdk_fio_setup_mount_complete(void *cb_arg, struct spdk_io_channel *ch, int status,
-			      const struct spdk_fsdev_mount_opts *opts,
-			      struct spdk_fsdev_file_object *root_fobject)
-{
-	struct spdk_fio_setup_ctx *setup = cb_arg;
-
-	if (status != 0) {
-		setup->status = status;
-		spdk_fio_setup_finish(setup);
-		return;
-	}
-
-	setup->root = root_fobject;
-	spdk_fio_setup_next_file(setup);
-}
-
-static void
-spdk_fio_setup_finish(struct spdk_fio_setup_ctx *setup)
-{
-	struct spdk_fio_oat_ctx *oat = setup->oat;
-	int rc;
-
-	if (setup->root != NULL) {
-		rc = spdk_fsdev_umount(setup->desc, setup->ch, setup->unique++,
-				       spdk_fio_setup_umount_complete, setup);
-		if (rc == 0) {
-			return;
-		}
-		setup->root = NULL;
-		if (setup->status == 0) {
-			setup->status = rc;
-		}
-	}
-
-	if (setup->ch != NULL) {
-		spdk_put_io_channel(setup->ch);
-	}
-	if (setup->desc != NULL) {
-		spdk_fsdev_close(setup->desc);
-	}
-
-	oat->ret = setup->status == 0 ? 0 : -1;
-	free(setup);
-	spdk_fio_wake_oat_waiter(oat);
-}
-
 static void
 spdk_fio_setup_oat(void *_ctx)
 {
 	struct spdk_fio_oat_ctx *oat = _ctx;
 	struct thread_data *td = oat->u.sa.td;
 	struct spdk_fio_options *fio_options = td->eo;
-	struct spdk_fio_setup_ctx *setup;
-	struct spdk_fsdev_mount_opts mount_opts = {};
+	struct spdk_fsdev_desc *desc = NULL;
+	struct fio_file *f;
+	unsigned int i;
+	uint64_t file_size;
 	int rc;
 
 	if (fio_options->fsdev_name == NULL || fio_options->fsdev_name[0] == '\0') {
@@ -997,43 +781,39 @@ spdk_fio_setup_oat(void *_ctx)
 		return;
 	}
 
-	setup = calloc(1, sizeof(*setup));
-	if (setup == NULL) {
-		oat->ret = -1;
-		spdk_fio_wake_oat_waiter(oat);
-		return;
-	}
-
-	setup->oat = oat;
-	setup->td = td;
-	setup->unique = 1;
-
-	rc = spdk_fsdev_open(fio_options->fsdev_name, spdk_fio_fsdev_event_cb, NULL, &setup->desc);
+	rc = spdk_fsdev_open(fio_options->fsdev_name, spdk_fio_fsdev_event_cb, NULL, &desc);
 	if (rc != 0) {
 		SPDK_ERRLOG("Unable to open fsdev %s\n", fio_options->fsdev_name);
-		setup->status = rc;
-		spdk_fio_setup_finish(setup);
-		return;
+		oat->ret = -1;
+		goto out;
 	}
 
-	setup->ch = spdk_fsdev_get_io_channel(setup->desc);
-	if (setup->ch == NULL) {
-		setup->status = -ENOMEM;
-		spdk_fio_setup_finish(setup);
-		return;
+	for_each_file(td, f, i) {
+		if (!spdk_fio_valid_file_name(f->file_name)) {
+			SPDK_ERRLOG("filename must be a single root entry: %s\n", f->file_name);
+			oat->ret = -1;
+			goto out;
+		}
+
+		file_size = spdk_fio_get_requested_file_size(td, f);
+		if (file_size == 0) {
+			SPDK_ERRLOG("file %s requires size/filesize because fsdev setup does not mount\n",
+				    f->file_name);
+			oat->ret = -1;
+			goto out;
+		}
+
+		f->real_file_size = file_size;
+		f->filetype = FIO_TYPE_BLOCK;
+		fio_file_set_size_known(f);
 	}
 
-	mount_opts.opts_size = sizeof(mount_opts);
-	mount_opts.max_write = fio_options->fsdev_mount_max_write ?
-			       fio_options->fsdev_mount_max_write : UINT32_MAX;
-	mount_opts.writeback_cache_enabled = fio_options->fsdev_writeback_cache;
-
-	rc = spdk_fsdev_mount(setup->desc, setup->ch, setup->unique++, &mount_opts,
-			      spdk_fio_setup_mount_complete, setup);
-	if (rc != 0) {
-		setup->status = rc;
-		spdk_fio_setup_finish(setup);
+	oat->ret = 0;
+out:
+	if (desc != NULL) {
+		spdk_fsdev_close(desc);
 	}
+	spdk_fio_wake_oat_waiter(oat);
 }
 
 static int
