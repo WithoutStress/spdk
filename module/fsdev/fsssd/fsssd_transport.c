@@ -9,7 +9,8 @@
 #define FSSSD_PRP_LIST_ENTRIES (FSSSD_NFS_PAGE_SIZE / sizeof(uint64_t))
 #define FSSSD_PRP_MAX_ENTRIES (FSSSD_PRP_LIST_ENTRIES + 1)
 #define FSSSD_NFS_READ_COUNT_MASK 0x7fffffffU
-#define FSSSD_ADMIN_QUEUE_SIZE 256
+#define FSSSD_ADMIN_QUEUE_SIZE 32
+#define FSSSD_IO_QUEUE_SIZE 256
 
 struct fsssd_transport {
 	char *name;
@@ -18,17 +19,11 @@ struct fsssd_transport {
 	struct spdk_nvme_transport_id trid;
 	struct spdk_nvme_ctrlr *ctrlr;
 	struct spdk_nvme_ns *ns;
-	struct spdk_nvme_qpair *qpair;
 };
 
 struct fsssd_transport_channel {
 	struct fsssd_transport *transport;
 	struct spdk_nvme_qpair *qpair;
-};
-
-struct fsssd_nvme_completion {
-	bool done;
-	struct spdk_nvme_cpl cpl;
 };
 
 struct fsssd_transport_payload {
@@ -70,6 +65,32 @@ fsssd_transport_parse_trid(struct spdk_nvme_transport_id *trid, const char *devi
 	return 0;
 }
 
+static int
+fsssd_transport_parse_hostnqn(char *hostnqn, size_t hostnqn_size, const char *device)
+{
+	const char *value;
+	size_t len;
+
+	value = strcasestr(device, "hostnqn:");
+	if (value == NULL) {
+		value = strcasestr(device, "hostnqn=");
+	}
+	if (value == NULL) {
+		return 0;
+	}
+
+	value += strlen("hostnqn:");
+	len = strcspn(value, " \t\n");
+	if (len >= hostnqn_size) {
+		SPDK_ERRLOG("hostnqn length %zu exceeds maximum allowed %zu\n", len, hostnqn_size - 1);
+		return -EINVAL;
+	}
+
+	memcpy(hostnqn, value, len);
+	hostnqn[len] = '\0';
+	return 0;
+}
+
 struct fsssd_transport *
 fsssd_transport_create(const struct fsssd_transport_opts *opts)
 {
@@ -78,45 +99,67 @@ fsssd_transport_create(const struct fsssd_transport_opts *opts)
 	int rc;
 
 	if (opts == NULL || opts->name == NULL || opts->device == NULL) {
+		SPDK_ERRLOG("Invalid fsssd transport options\n");
 		return NULL;
 	}
 
 	transport = calloc(1, sizeof(*transport));
 	if (transport == NULL) {
+		SPDK_ERRLOG("Failed to allocate fsssd transport\n");
 		return NULL;
 	}
 
 	transport->name = strdup(opts->name);
 	transport->device = strdup(opts->device);
-	transport->nsid = opts->nsid ? opts->nsid : 1;
+	transport->nsid = opts->nsid;
 	if (transport->name == NULL || transport->device == NULL) {
+		SPDK_ERRLOG("Failed to duplicate fsssd transport strings\n");
 		fsssd_transport_destroy(transport);
 		return NULL;
 	}
 
 	rc = fsssd_transport_parse_trid(&transport->trid, transport->device);
 	if (rc != 0) {
+		SPDK_ERRLOG("Failed to parse fsssd transport ID: %s\n", transport->device);
 		fsssd_transport_destroy(transport);
 		return NULL;
 	}
 
 	spdk_nvme_ctrlr_get_default_ctrlr_opts(&ctrlr_opts, sizeof(ctrlr_opts));
 	ctrlr_opts.admin_queue_size = FSSSD_ADMIN_QUEUE_SIZE;
+	ctrlr_opts.io_queue_size = FSSSD_IO_QUEUE_SIZE;
+	ctrlr_opts.io_queue_requests = FSSSD_IO_QUEUE_SIZE;
+	rc = fsssd_transport_parse_hostnqn(ctrlr_opts.hostnqn, sizeof(ctrlr_opts.hostnqn),
+					   transport->device);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to parse fsssd hostnqn from transport ID: %s\n", transport->device);
+		fsssd_transport_destroy(transport);
+		return NULL;
+	}
 
 	transport->ctrlr = spdk_nvme_connect(&transport->trid, &ctrlr_opts, sizeof(ctrlr_opts));
 	if (transport->ctrlr == NULL) {
+		SPDK_ERRLOG("Failed to connect NVMe controller for fsssd device: %s\n", transport->device);
 		fsssd_transport_destroy(transport);
 		return NULL;
+	}
+
+	if (transport->nsid == 0) {
+		transport->nsid = spdk_nvme_ctrlr_get_first_active_ns(transport->ctrlr);
+		if (transport->nsid == 0) {
+			SPDK_ERRLOG("No active NVMe namespace found for fsssd device: %s\n",
+				    transport->device);
+			fsssd_transport_destroy(transport);
+			return NULL;
+		}
+		SPDK_NOTICELOG("Using first active NVMe namespace %" PRIu32 " for fsssd device: %s\n",
+			       transport->nsid, transport->device);
 	}
 
 	transport->ns = spdk_nvme_ctrlr_get_ns(transport->ctrlr, transport->nsid);
 	if (transport->ns == NULL || !spdk_nvme_ns_is_active(transport->ns)) {
-		fsssd_transport_destroy(transport);
-		return NULL;
-	}
-
-	transport->qpair = spdk_nvme_ctrlr_alloc_io_qpair(transport->ctrlr, NULL, 0);
-	if (transport->qpair == NULL) {
+		SPDK_ERRLOG("NVMe namespace %" PRIu32 " is not active for fsssd device: %s\n",
+			    transport->nsid, transport->device);
 		fsssd_transport_destroy(transport);
 		return NULL;
 	}
@@ -131,9 +174,6 @@ fsssd_transport_destroy(struct fsssd_transport *transport)
 		return;
 	}
 
-	if (transport->qpair != NULL) {
-		spdk_nvme_ctrlr_free_io_qpair(transport->qpair);
-	}
 	if (transport->ctrlr != NULL) {
 		spdk_nvme_detach(transport->ctrlr);
 	}
@@ -182,20 +222,24 @@ fsssd_transport_channel_destroy(struct fsssd_transport_channel *channel)
 int
 fsssd_transport_channel_poll(struct fsssd_transport_channel *channel)
 {
+	int32_t admin_rc;
+	int32_t io_rc;
+
 	if (channel == NULL || channel->qpair == NULL) {
 		return -EINVAL;
 	}
 
-	return spdk_nvme_qpair_process_completions(channel->qpair, 0);
-}
+	admin_rc = spdk_nvme_ctrlr_process_admin_completions(channel->transport->ctrlr);
+	if (admin_rc < 0) {
+		return admin_rc;
+	}
 
-static void
-fsssd_transport_nvme_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
-{
-	struct fsssd_nvme_completion *completion = ctx;
+	io_rc = spdk_nvme_qpair_process_completions(channel->qpair, 0);
+	if (io_rc < 0) {
+		return io_rc;
+	}
 
-	completion->cpl = *cpl;
-	completion->done = true;
+	return admin_rc + io_rc;
 }
 
 static uint32_t
@@ -239,27 +283,6 @@ fsssd_transport_status_to_errno(const struct spdk_nvme_cpl *cpl)
 	}
 
 	return -EIO;
-}
-
-static int
-fsssd_transport_wait_completion(struct fsssd_transport *transport,
-				struct fsssd_nvme_completion *completion)
-{
-	uint64_t timeout_tsc;
-	int32_t rc;
-
-	timeout_tsc = spdk_get_ticks() + FSSSD_NVME_CMD_TIMEOUT_SEC * spdk_get_ticks_hz();
-	while (!completion->done) {
-		rc = spdk_nvme_qpair_process_completions(transport->qpair, 0);
-		if (rc < 0) {
-			return rc;
-		}
-		if (spdk_get_ticks() > timeout_tsc) {
-			return -ETIMEDOUT;
-		}
-	}
-
-	return fsssd_transport_status_to_errno(&completion->cpl);
 }
 
 static int
@@ -603,7 +626,7 @@ fsssd_transport_submit_nvme(struct fsssd_transport *transport, struct spdk_nvme_
 	int rc;
 
 	fsssd_transport_build_cmd(transport, req, &cmd);
-	if (payload->len != 0 && transport->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) { /* TODO: it may not support NVMe-oF */
+	if (payload->len != 0 && transport->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {  /* TODO: it may not support NVMe-oF */
 		rc = fsssd_transport_build_prps(payload, &cmd);
 		if (rc == -EAGAIN) {
 			// SPDK_NOTICELOG("fsssd prp path: fallback bounce opcode=%u len=%u iovcnt=%u\n",
@@ -636,44 +659,6 @@ fsssd_transport_submit_nvme(struct fsssd_transport *transport, struct spdk_nvme_
 
 	return spdk_nvme_ctrlr_cmd_io_raw(transport->ctrlr, qpair, &cmd, payload->buf,
 					  payload->len, cb_fn, cb_arg);
-}
-
-int
-fsssd_transport_submit(struct fsssd_transport *transport, const struct fsssd_request *req,
-		       struct fsssd_response *rsp)
-{
-	struct fsssd_nvme_completion completion = {};
-	struct fsssd_transport_payload payload = {};
-	int rc;
-
-	if (transport == NULL || req == NULL || rsp == NULL) {
-		return -EINVAL;
-	}
-
-	memset(rsp, 0, sizeof(*rsp));
-	rc = fsssd_transport_prepare_payload(req, &payload);
-	if (rc != 0) {
-		return rc;
-	}
-
-	rc = fsssd_transport_submit_nvme(transport, transport->qpair, req, &payload,
-					 fsssd_transport_nvme_complete, &completion);
-	if (rc != 0) {
-		fsssd_transport_release_payload(&payload, false);
-		return rc;
-	}
-
-	rc = fsssd_transport_wait_completion(transport, &completion);
-	if (rc != 0) {
-		fsssd_transport_release_payload(&payload, false);
-		return rc;
-	}
-	fsssd_transport_release_payload(&payload, true);
-
-	rsp->result = completion.cpl.cdw0 | ((uint64_t)completion.cpl.cdw1 << 32);
-	rsp->data_size = fsssd_transport_data_size(req->opcode, completion.cpl.cdw0);
-
-	return 0;
 }
 
 static void

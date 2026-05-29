@@ -45,17 +45,6 @@ void fsssd_client_destroy(struct fsssd_client *client);
 struct fsssd_client_channel *fsssd_client_channel_create(struct fsssd_client *client);
 void fsssd_client_channel_destroy(struct fsssd_client_channel *channel);
 int fsssd_client_channel_poll(struct fsssd_client_channel *channel);
-int fsssd_client_mount(struct fsssd_client *client, uint64_t *root_ino, struct fsssd_attr *attr);
-int fsssd_client_getattr(struct fsssd_client *client, uint64_t ino, struct fsssd_attr *attr);
-int fsssd_client_lookup(struct fsssd_client *client, uint64_t parent_ino, const char *name,
-			uint64_t *ino, struct fsssd_attr *attr);
-int fsssd_client_create_file(struct fsssd_client *client, uint64_t parent_ino, const char *name,
-			     uint16_t mode, uint64_t *ino, struct fsssd_attr *attr);
-int fsssd_client_statfs(struct fsssd_client *client, uint64_t ino, struct fsssd_statfs *statfs);
-int fsssd_client_read(struct fsssd_client *client, uint64_t ino, uint64_t offset, size_t size,
-		      struct iovec *iov, uint32_t iovcnt, uint32_t *data_size);
-int fsssd_client_write(struct fsssd_client *client, uint64_t ino, uint64_t offset, size_t size,
-		       const struct iovec *iov, uint32_t iovcnt, uint32_t *data_size);
 int fsssd_client_submit_async(struct fsssd_client *client, struct fsssd_client_channel *channel,
 			      const struct fsssd_request *req,
 			      fsssd_transport_complete_cb cb_fn, void *cb_arg);

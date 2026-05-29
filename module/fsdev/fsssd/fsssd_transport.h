@@ -39,8 +39,6 @@ void fsssd_transport_destroy(struct fsssd_transport *transport);
 struct fsssd_transport_channel *fsssd_transport_channel_create(struct fsssd_transport *transport);
 void fsssd_transport_channel_destroy(struct fsssd_transport_channel *channel);
 int fsssd_transport_channel_poll(struct fsssd_transport_channel *channel);
-int fsssd_transport_submit(struct fsssd_transport *transport, const struct fsssd_request *req,
-			   struct fsssd_response *rsp);
 int fsssd_transport_submit_async(struct fsssd_transport *transport,
 				 struct fsssd_transport_channel *channel,
 				 const struct fsssd_request *req,
