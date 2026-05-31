@@ -43,6 +43,7 @@ struct fsssd_fsdev_io {
 	struct spdk_fsdev_file_object *parent;
 	struct fsssd_nfs_fattr wire_attr;
 	struct fsssd_nfs_fsstat wire_statfs;
+	struct fsssd_transport_async_request transport_req;
 };
 
 struct fsssd_channel_entry {
@@ -243,6 +244,7 @@ fsssd_submit_async(struct spdk_io_channel *ch, struct fsssd_fsdev *vfsdev,
 		   const struct fsssd_request *req,
 		   fsssd_transport_complete_cb cb_fn, struct spdk_fsdev_io *fsdev_io)
 {
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
 	struct fsssd_client_channel *client_channel;
 
 	client_channel = fsssd_get_client_channel(ch, vfsdev);
@@ -250,7 +252,8 @@ fsssd_submit_async(struct spdk_io_channel *ch, struct fsssd_fsdev *vfsdev,
 		return -ENOMEM;
 	}
 
-	return fsssd_client_submit_async(vfsdev->client, client_channel, req, cb_fn, fsdev_io);
+	return fsssd_client_submit_async(vfsdev->client, client_channel, req,
+					 &fsssd_io->transport_req, cb_fn, fsdev_io);
 }
 
 static void

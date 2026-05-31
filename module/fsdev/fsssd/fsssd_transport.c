@@ -26,28 +26,6 @@ struct fsssd_transport_channel {
 	struct spdk_nvme_qpair *qpair;
 };
 
-struct fsssd_transport_payload {
-	void *buf;
-	uint32_t len;
-	void *copy_dst;
-	struct iovec *iov;
-	struct iovec *copy_iov;
-	uint64_t *prp_list;
-	uint32_t iovcnt;
-	uint32_t copy_iovcnt;
-	bool copy_out;
-	bool iov_copy_out;
-	bool dma_allocated;
-};
-
-struct fsssd_transport_async_request {
-	struct fsssd_transport_payload payload;
-	struct fsssd_response rsp;
-	fsssd_transport_complete_cb cb_fn;
-	void *cb_arg;
-	enum fsssd_nfs_opcode opcode;
-};
-
 static int
 fsssd_transport_parse_trid(struct spdk_nvme_transport_id *trid, const char *device)
 {
@@ -129,6 +107,7 @@ fsssd_transport_create(const struct fsssd_transport_opts *opts)
 	ctrlr_opts.admin_queue_size = FSSSD_ADMIN_QUEUE_SIZE;
 	ctrlr_opts.io_queue_size = FSSSD_IO_QUEUE_SIZE;
 	ctrlr_opts.io_queue_requests = FSSSD_IO_QUEUE_SIZE;
+	ctrlr_opts.keep_alive_timeout_ms = 0;
 	rc = fsssd_transport_parse_hostnqn(ctrlr_opts.hostnqn, sizeof(ctrlr_opts.hostnqn),
 					   transport->device);
 	if (rc != 0) {
@@ -186,6 +165,7 @@ struct fsssd_transport_channel *
 fsssd_transport_channel_create(struct fsssd_transport *transport)
 {
 	struct fsssd_transport_channel *channel;
+	struct spdk_nvme_io_qpair_opts qpair_opts;
 
 	if (transport == NULL) {
 		return NULL;
@@ -197,7 +177,13 @@ fsssd_transport_channel_create(struct fsssd_transport *transport)
 	}
 
 	channel->transport = transport;
-	channel->qpair = spdk_nvme_ctrlr_alloc_io_qpair(transport->ctrlr, NULL, 0);
+	spdk_nvme_ctrlr_get_default_io_qpair_opts(transport->ctrlr, &qpair_opts,
+			sizeof(qpair_opts));
+	if (transport->trid.trtype == SPDK_NVME_TRANSPORT_RDMA) {
+		qpair_opts.delay_cmd_submit = true;
+	}
+	channel->qpair = spdk_nvme_ctrlr_alloc_io_qpair(transport->ctrlr, &qpair_opts,
+			 sizeof(qpair_opts));
 	if (channel->qpair == NULL) {
 		free(channel);
 		return NULL;
@@ -229,10 +215,10 @@ fsssd_transport_channel_poll(struct fsssd_transport_channel *channel)
 		return -EINVAL;
 	}
 
-	admin_rc = spdk_nvme_ctrlr_process_admin_completions(channel->transport->ctrlr);
-	if (admin_rc < 0) {
-		return admin_rc;
-	}
+	// admin_rc = spdk_nvme_ctrlr_process_admin_completions(channel->transport->ctrlr);
+	// if (admin_rc < 0) {
+	// 	return admin_rc;
+	// }
 
 	io_rc = spdk_nvme_qpair_process_completions(channel->qpair, 0);
 	if (io_rc < 0) {
@@ -665,6 +651,7 @@ static void
 fsssd_transport_async_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 {
 	struct fsssd_transport_async_request *async_req = ctx;
+	struct fsssd_response rsp = {};
 	int status;
 
 	status = fsssd_transport_status_to_errno(cpl);
@@ -672,34 +659,29 @@ fsssd_transport_async_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 		async_req->rsp.result = cpl->cdw0 | ((uint64_t)cpl->cdw1 << 32);
 		async_req->rsp.data_size = fsssd_transport_data_size(async_req->opcode, cpl->cdw0);
 	}
+	rsp = async_req->rsp;
 
 	fsssd_transport_release_payload(&async_req->payload, status == 0);
-	async_req->cb_fn(async_req->cb_arg, status, &async_req->rsp);
-	free(async_req);
+	async_req->cb_fn(async_req->cb_arg, status, &rsp);
 }
 
 int
 fsssd_transport_submit_async(struct fsssd_transport *transport,
 			     struct fsssd_transport_channel *channel,
 			     const struct fsssd_request *req,
+			     struct fsssd_transport_async_request *async_req,
 			     fsssd_transport_complete_cb cb_fn, void *cb_arg)
 {
-	struct fsssd_transport_async_request *async_req;
 	int rc;
 
 	if (transport == NULL || channel == NULL || channel->qpair == NULL ||
-	    req == NULL || cb_fn == NULL) {
+	    req == NULL || async_req == NULL || cb_fn == NULL) {
 		return -EINVAL;
 	}
 
-	async_req = calloc(1, sizeof(*async_req));
-	if (async_req == NULL) {
-		return -ENOMEM;
-	}
-
+	memset(async_req, 0, sizeof(*async_req));
 	rc = fsssd_transport_prepare_payload(req, &async_req->payload);
 	if (rc != 0) {
-		free(async_req);
 		return rc;
 	}
 
@@ -710,7 +692,6 @@ fsssd_transport_submit_async(struct fsssd_transport *transport,
 					 fsssd_transport_async_complete, async_req);
 	if (rc != 0) {
 		fsssd_transport_release_payload(&async_req->payload, false);
-		free(async_req);
 		return rc;
 	}
 

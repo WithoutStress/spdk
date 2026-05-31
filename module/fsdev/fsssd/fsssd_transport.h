@@ -34,6 +34,28 @@ struct fsssd_response {
 typedef void (*fsssd_transport_complete_cb)(void *cb_arg, int status,
 		const struct fsssd_response *rsp);
 
+struct fsssd_transport_payload {
+	void *buf;
+	uint32_t len;
+	void *copy_dst;
+	struct iovec *iov;
+	struct iovec *copy_iov;
+	uint64_t *prp_list;
+	uint32_t iovcnt;
+	uint32_t copy_iovcnt;
+	bool copy_out;
+	bool iov_copy_out;
+	bool dma_allocated;
+};
+
+struct fsssd_transport_async_request {
+	struct fsssd_transport_payload payload;
+	struct fsssd_response rsp;
+	fsssd_transport_complete_cb cb_fn;
+	void *cb_arg;
+	enum fsssd_nfs_opcode opcode;
+};
+
 struct fsssd_transport *fsssd_transport_create(const struct fsssd_transport_opts *opts);
 void fsssd_transport_destroy(struct fsssd_transport *transport);
 struct fsssd_transport_channel *fsssd_transport_channel_create(struct fsssd_transport *transport);
@@ -42,6 +64,7 @@ int fsssd_transport_channel_poll(struct fsssd_transport_channel *channel);
 int fsssd_transport_submit_async(struct fsssd_transport *transport,
 				 struct fsssd_transport_channel *channel,
 				 const struct fsssd_request *req,
+				 struct fsssd_transport_async_request *async_req,
 				 fsssd_transport_complete_cb cb_fn, void *cb_arg);
 const char *fsssd_transport_get_name(const struct fsssd_transport *transport);
 const char *fsssd_transport_get_device(const struct fsssd_transport *transport);

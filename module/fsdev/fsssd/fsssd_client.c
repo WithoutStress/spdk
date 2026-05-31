@@ -146,6 +146,7 @@ fsssd_client_channel_poll(struct fsssd_client_channel *channel)
 int
 fsssd_client_submit_async(struct fsssd_client *client, struct fsssd_client_channel *channel,
 			  const struct fsssd_request *req,
+			  struct fsssd_transport_async_request *async_req,
 			  fsssd_transport_complete_cb cb_fn, void *cb_arg)
 {
 	if (client == NULL || channel == NULL) {
@@ -153,7 +154,7 @@ fsssd_client_submit_async(struct fsssd_client *client, struct fsssd_client_chann
 	}
 
 	return fsssd_transport_submit_async(client->transport, channel->transport_channel, req,
-					   cb_fn, cb_arg);
+					   async_req, cb_fn, cb_arg);
 }
 
 const char *

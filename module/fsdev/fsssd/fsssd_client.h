@@ -47,6 +47,7 @@ void fsssd_client_channel_destroy(struct fsssd_client_channel *channel);
 int fsssd_client_channel_poll(struct fsssd_client_channel *channel);
 int fsssd_client_submit_async(struct fsssd_client *client, struct fsssd_client_channel *channel,
 			      const struct fsssd_request *req,
+			      struct fsssd_transport_async_request *async_req,
 			      fsssd_transport_complete_cb cb_fn, void *cb_arg);
 void fsssd_client_attr_from_result(struct fsssd_attr *attr, uint64_t ino);
 void fsssd_client_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fattr *wire,
