@@ -208,8 +208,8 @@ fsssd_transport_channel_destroy(struct fsssd_transport_channel *channel)
 int
 fsssd_transport_channel_poll(struct fsssd_transport_channel *channel)
 {
-	int32_t admin_rc;
-	int32_t io_rc;
+	int32_t admin_rc = 0;
+	int32_t io_rc = 0;
 
 	if (channel == NULL || channel->qpair == NULL) {
 		return -EINVAL;
@@ -582,13 +582,13 @@ fsssd_transport_build_cmd(struct fsssd_transport *transport, const struct fsssd_
 		break;
 	case fsssd_cmd_nfs_read:
 		cmd->opc = SPDK_NVME_OPC_READ;
-		cdw3.s.mode = req->size / FSSSD_NFS_PAGE_SIZE;
+		cdw3.s.namelen = req->size / FSSSD_NFS_PAGE_SIZE;
 		cmd->rsvd3 = cdw3.val;
 		cmd->cdw13 = req->offset / FSSSD_NFS_PAGE_SIZE;
 		break;
 	case fsssd_cmd_nfs_write:
 		cmd->opc = SPDK_NVME_OPC_WRITE;
-		cdw3.s.mode = req->size / FSSSD_NFS_PAGE_SIZE;
+		cdw3.s.namelen = req->size / FSSSD_NFS_PAGE_SIZE;
 		cmd->rsvd3 = cdw3.val;
 		cmd->cdw13 = req->offset / FSSSD_NFS_PAGE_SIZE;
 		break;
