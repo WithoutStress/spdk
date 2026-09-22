@@ -4,8 +4,28 @@
 #include "spdk/stdinc.h"
 
 #define FSSSD_NFS_PAGE_SIZE 4096
-#define FSSSD_NFS_MAX_NAME_LEN 24
+#define FSSSD_NFS_MAX_NAME_LEN 255	/* cdw3.namelen is u8 */
 #define FSSSD_NVME_CMD_TIMEOUT_SEC 30
+
+/*
+ * Metadata command reply page layout (must match nvmevirt/nvme_nfs.h and
+ * client/nfs/internal.h). Metadata commands are sent with the real NVMe
+ * opcode READ and one page: the request payload (filename or iattr) at
+ * FSSSD_NFS_META_REQ_OFF, the device writes the target object's fattr at
+ * FSSSD_NFS_META_OBJ_OFF and the parent dir's fattr at FSSSD_NFS_META_DIR_OFF.
+ */
+#define FSSSD_NFS_META_REQ_OFF 0
+#define FSSSD_NFS_META_OBJ_OFF 2048
+#define FSSSD_NFS_META_DIR_OFF 2560
+
+/* struct iattr ia_valid bits (linux/fs.h), consumed by the device's setattr */
+#define FSSSD_ATTR_MODE		(1 << 0)
+#define FSSSD_ATTR_UID		(1 << 1)
+#define FSSSD_ATTR_GID		(1 << 2)
+#define FSSSD_ATTR_SIZE		(1 << 3)
+#define FSSSD_ATTR_ATIME	(1 << 4)
+#define FSSSD_ATTR_MTIME	(1 << 5)
+#define FSSSD_ATTR_CTIME	(1 << 6)
 
 enum fsssd_nfs_opcode {
 	fsssd_cmd_nfs_symlink	= 0x50,
@@ -90,6 +110,20 @@ struct fsssd_nfs_fsstat {
 	uint64_t tfiles;
 	uint64_t ffiles;
 	uint64_t afiles;
+};
+
+/* mirror of the kernel's struct iattr (80 bytes) */
+struct fsssd_nfs_iattr {
+	uint32_t ia_valid;
+	uint16_t ia_mode;
+	uint16_t reserved0;
+	uint32_t ia_uid;
+	uint32_t ia_gid;
+	uint64_t ia_size;
+	struct fsssd_nfs_timespec ia_atime;
+	struct fsssd_nfs_timespec ia_mtime;
+	struct fsssd_nfs_timespec ia_ctime;
+	uint64_t ia_file;
 };
 
 #endif

@@ -17,16 +17,6 @@ struct fsssd_client_channel {
 };
 
 void
-fsssd_client_attr_from_result(struct fsssd_attr *attr, uint64_t ino)
-{
-	memset(attr, 0, sizeof(*attr));
-	attr->ino = ino;
-	attr->mode = S_IFREG | 0644;
-	attr->nlink = 1;
-	attr->blksize = 4096;
-}
-
-void
 fsssd_client_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fattr *wire,
 			    uint64_t ino)
 {
@@ -37,10 +27,14 @@ fsssd_client_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fatt
 	attr->atime = wire->atime.tv_sec;
 	attr->mtime = wire->mtime.tv_sec;
 	attr->ctime = wire->ctime.tv_sec;
+	attr->atimensec = wire->atime.tv_nsec;
+	attr->mtimensec = wire->mtime.tv_nsec;
+	attr->ctimensec = wire->ctime.tv_nsec;
 	attr->mode = wire->mode;
 	attr->nlink = wire->nlink;
 	attr->uid = wire->uid;
 	attr->gid = wire->gid;
+	attr->rdev = wire->rdev;
 	attr->blksize = FSSSD_NFS_PAGE_SIZE;
 }
 

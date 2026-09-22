@@ -238,37 +238,32 @@ fsssd_transport_data_size(enum fsssd_nfs_opcode opcode, uint32_t cdw0)
 	return cdw0;
 }
 
+/*
+ * The device keeps the CQE status for transport errors only. FS-level errno
+ * arrives in cdw0 as a negative value, except for read/write (cdw0 is the
+ * byte count, bit 31 of read is EOF) and readdir (own result format).
+ */
 static int
-fsssd_transport_status_to_errno(const struct spdk_nvme_cpl *cpl)
+fsssd_transport_cpl_to_errno(enum fsssd_nfs_opcode opcode, const struct spdk_nvme_cpl *cpl)
 {
-	if (!spdk_nvme_cpl_is_error(cpl)) {
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		return -EIO;
+	}
+
+	switch (opcode) {
+	case fsssd_cmd_nfs_read:
+	case fsssd_cmd_nfs_write:
+	case fsssd_cmd_nfs_readdir:
 		return 0;
+	default:
+		break;
 	}
 
-	if (cpl->status.sct == SPDK_NVME_SCT_GENERIC) {
-		switch (cpl->status.sc) {
-		case ENOENT:
-			return -ENOENT;
-		case EEXIST:
-			return -EEXIST;
-		case ENOTEMPTY:
-			return -ENOTEMPTY;
-		case ESTALE:
-			return -ESTALE;
-		case EACCES:
-			return -EACCES;
-		case ENOMEM:
-			return -ENOMEM;
-		case EINVAL:
-			return -EINVAL;
-		case ENOSPC:
-			return -ENOSPC;
-		default:
-			break;
-		}
+	if ((int32_t)cpl->cdw0 < 0) {
+		return (int32_t)cpl->cdw0;
 	}
 
-	return -EIO;
+	return 0;
 }
 
 static int
@@ -319,6 +314,23 @@ fsssd_transport_iov_copy_from_buf(struct iovec *iov, uint32_t iovcnt, const void
 	}
 }
 
+/* one zeroed page: request bytes at REQ_OFF, device replies fattr at OBJ/DIR_OFF */
+static int
+fsssd_transport_prepare_meta_page(const void *data, size_t len, struct fsssd_nfs_fattr *attr_dst,
+				  struct fsssd_transport_payload *payload)
+{
+	payload->buf = spdk_dma_zmalloc(FSSSD_NFS_PAGE_SIZE, FSSSD_NFS_PAGE_SIZE, NULL);
+	if (payload->buf == NULL) {
+		return -ENOMEM;
+	}
+
+	memcpy((uint8_t *)payload->buf + FSSSD_NFS_META_REQ_OFF, data, len);
+	payload->len = FSSSD_NFS_PAGE_SIZE;
+	payload->attr_dst = attr_dst;
+	payload->dma_allocated = true;
+	return 0;
+}
+
 static int
 fsssd_transport_prepare_payload(const struct fsssd_request *req,
 				struct fsssd_transport_payload *payload)
@@ -341,7 +353,13 @@ fsssd_transport_prepare_payload(const struct fsssd_request *req,
 		if (name_len > FSSSD_NFS_MAX_NAME_LEN) {
 			return -ENAMETOOLONG;
 		}
-		return 0;
+		return fsssd_transport_prepare_meta_page(req->name, name_len, req->obj_attr, payload);
+	case fsssd_cmd_nfs_setattr:
+		if (req->payload == NULL || req->payload_len > FSSSD_NFS_META_OBJ_OFF) {
+			return -EINVAL;
+		}
+		return fsssd_transport_prepare_meta_page(req->payload, req->payload_len, req->obj_attr,
+				payload);
 	case fsssd_cmd_nfs_getattr:
 	case fsssd_cmd_nfs_fsstat:
 	case fsssd_cmd_nfs_readdir:
@@ -385,6 +403,10 @@ fsssd_transport_release_payload(struct fsssd_transport_payload *payload, bool su
 {
 	if (success && payload->copy_out) {
 		memcpy(payload->copy_dst, payload->buf, payload->len);
+	}
+	if (success && payload->attr_dst != NULL) {
+		memcpy(payload->attr_dst, (uint8_t *)payload->buf + FSSSD_NFS_META_OBJ_OFF,
+		       sizeof(*payload->attr_dst));
 	}
 	if (success && payload->iov_copy_out) {
 		fsssd_transport_iov_copy_from_buf(payload->copy_iov, payload->copy_iovcnt, payload->buf);
@@ -541,25 +563,10 @@ fsssd_transport_build_prps(struct fsssd_transport_payload *payload, struct spdk_
 }
 
 static void
-fsssd_transport_pack_name(struct spdk_nvme_cmd *cmd, const char *name, size_t name_len)
-{
-	uint8_t inline_name[FSSSD_NFS_MAX_NAME_LEN] = {};
-
-	memcpy(inline_name, name, name_len);
-	memcpy(&cmd->cdw10, inline_name, sizeof(cmd->cdw10));
-	memcpy(&cmd->cdw11, inline_name + 4, sizeof(cmd->cdw11));
-	memcpy(&cmd->cdw12, inline_name + 8, sizeof(cmd->cdw12));
-	memcpy(&cmd->cdw13, inline_name + 12, sizeof(cmd->cdw13));
-	memcpy(&cmd->cdw14, inline_name + 16, sizeof(cmd->cdw14));
-	memcpy(&cmd->cdw15, inline_name + 20, sizeof(cmd->cdw15));
-}
-
-static void
 fsssd_transport_build_cmd(struct fsssd_transport *transport, const struct fsssd_request *req,
 			  struct spdk_nvme_cmd *cmd)
 {
 	struct fsssd_cdw3 cdw3 = {};
-	size_t name_len;
 
 	memset(cmd, 0, sizeof(*cmd));
 	cdw3.s.opcode = req->opcode;
@@ -574,11 +581,14 @@ fsssd_transport_build_cmd(struct fsssd_transport *transport, const struct fsssd_
 	case fsssd_cmd_nfs_mkdir:
 	case fsssd_cmd_nfs_remove:
 	case fsssd_cmd_nfs_rmdir:
-		name_len = req->name == NULL ? 0 : strlen(req->name);
-		cdw3.s.namelen = name_len;
+		/* NVMe READ opcode tells the device a reply page is attached */
+		cmd->opc = SPDK_NVME_OPC_READ;
+		cdw3.s.namelen = strlen(req->name);
 		cdw3.s.mode = req->mode;
 		cmd->rsvd3 = cdw3.val;
-		fsssd_transport_pack_name(cmd, req->name, name_len);
+		break;
+	case fsssd_cmd_nfs_setattr:
+		cmd->opc = SPDK_NVME_OPC_READ;
 		break;
 	case fsssd_cmd_nfs_read:
 		cmd->opc = SPDK_NVME_OPC_READ;
@@ -654,7 +664,7 @@ fsssd_transport_async_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 	struct fsssd_response rsp = {};
 	int status;
 
-	status = fsssd_transport_status_to_errno(cpl);
+	status = fsssd_transport_cpl_to_errno(async_req->opcode, cpl);
 	if (status == 0) {
 		async_req->rsp.result = cpl->cdw0 | ((uint64_t)cpl->cdw1 << 32);
 		async_req->rsp.data_size = fsssd_transport_data_size(async_req->opcode, cpl->cdw0);

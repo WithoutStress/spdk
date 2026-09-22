@@ -22,10 +22,14 @@ struct fsssd_attr {
 	uint64_t atime;
 	uint64_t mtime;
 	uint64_t ctime;
+	uint32_t atimensec;
+	uint32_t mtimensec;
+	uint32_t ctimensec;
 	uint32_t mode;
 	uint32_t nlink;
 	uint32_t uid;
 	uint32_t gid;
+	uint32_t rdev;
 	uint32_t blksize;
 };
 
@@ -49,7 +53,6 @@ int fsssd_client_submit_async(struct fsssd_client *client, struct fsssd_client_c
 			      const struct fsssd_request *req,
 			      struct fsssd_transport_async_request *async_req,
 			      fsssd_transport_complete_cb cb_fn, void *cb_arg);
-void fsssd_client_attr_from_result(struct fsssd_attr *attr, uint64_t ino);
 void fsssd_client_attr_from_wire(struct fsssd_attr *attr, const struct fsssd_nfs_fattr *wire,
 				 uint64_t ino);
 void fsssd_client_statfs_from_wire(struct fsssd_statfs *statfs,

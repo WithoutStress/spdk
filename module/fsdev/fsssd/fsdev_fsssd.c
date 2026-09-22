@@ -43,6 +43,7 @@ struct fsssd_fsdev_io {
 	struct spdk_fsdev_file_object *parent;
 	struct fsssd_nfs_fattr wire_attr;
 	struct fsssd_nfs_fsstat wire_statfs;
+	struct fsssd_nfs_iattr wire_iattr;
 	struct fsssd_transport_async_request transport_req;
 };
 
@@ -175,10 +176,14 @@ fsssd_attr_to_fsdev(const struct fsssd_attr *src, struct spdk_fsdev_file_attr *d
 	dst->atime = src->atime;
 	dst->mtime = src->mtime;
 	dst->ctime = src->ctime;
+	dst->atimensec = src->atimensec;
+	dst->mtimensec = src->mtimensec;
+	dst->ctimensec = src->ctimensec;
 	dst->mode = src->mode;
 	dst->nlink = src->nlink;
 	dst->uid = src->uid;
 	dst->gid = src->gid;
+	dst->rdev = src->rdev;
 	dst->blksize = src->blksize;
 }
 
@@ -329,7 +334,7 @@ fsssd_lookup_complete(void *cb_arg, int status, const struct fsssd_response *rsp
 	}
 
 	if (status == 0) {
-		fsssd_client_attr_from_result(&attr, rsp->result);
+		fsssd_client_attr_from_wire(&attr, &fsssd_io->wire_attr, rsp->result);
 		fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.lookup.attr);
 	}
 
@@ -357,6 +362,7 @@ fsssd_lookup(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	req.opcode = fsssd_cmd_nfs_lookup;
 	req.handle = parent->ino;
 	req.name = fsdev_io->u_in.lookup.name;
+	req.obj_attr = &fsssd_io->wire_attr;
 	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_lookup_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
@@ -463,7 +469,7 @@ fsssd_create_complete(void *cb_arg, int status, const struct fsssd_response *rsp
 	}
 
 	if (status == 0) {
-		fsssd_client_attr_from_result(&attr, rsp->result);
+		fsssd_client_attr_from_wire(&attr, &fsssd_io->wire_attr, rsp->result);
 		fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.create.attr);
 	}
 
@@ -492,7 +498,218 @@ fsssd_create(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	req.handle = parent->ino;
 	req.name = fsdev_io->u_in.create.name;
 	req.mode = fsdev_io->u_in.create.mode;
+	req.obj_attr = &fsssd_io->wire_attr;
 	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_create_complete, fsdev_io);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return IO_STATUS_ASYNC;
+}
+
+static void
+fsssd_mkdir_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct fsssd_attr attr;
+
+	if (status == 0) {
+		fsdev_io->u_out.mkdir.fobject = fsssd_file_object_create(fsssd_io->parent, rsp->result);
+		if (fsdev_io->u_out.mkdir.fobject == NULL) {
+			status = -ENOMEM;
+		}
+	}
+
+	if (status == 0) {
+		fsssd_client_attr_from_wire(&attr, &fsssd_io->wire_attr, rsp->result);
+		fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.mkdir.attr);
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
+static int
+fsssd_mkdir(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
+{
+	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct spdk_fsdev_file_object *parent = fsdev_io->u_in.mkdir.parent_fobject;
+	struct fsssd_request req = {};
+	int rc;
+
+	if (parent == NULL) {
+		parent = vfsdev->root;
+	}
+
+	if (parent == NULL || fsdev_io->u_in.mkdir.name == NULL) {
+		return -EINVAL;
+	}
+
+	fsssd_io->parent = parent;
+	req.opcode = fsssd_cmd_nfs_mkdir;
+	req.handle = parent->ino;
+	req.name = fsdev_io->u_in.mkdir.name;
+	req.mode = fsdev_io->u_in.mkdir.mode;
+	req.obj_attr = &fsssd_io->wire_attr;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_mkdir_complete, fsdev_io);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return IO_STATUS_ASYNC;
+}
+
+static void
+fsssd_status_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+
+	UNUSED(rsp);
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
+/* unlink and rmdir: parent handle + name, no reply payload */
+static int
+fsssd_remove_name(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io,
+		  enum fsssd_nfs_opcode opcode, struct spdk_fsdev_file_object *parent,
+		  const char *name)
+{
+	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct fsssd_request req = {};
+	int rc;
+
+	if (parent == NULL) {
+		parent = vfsdev->root;
+	}
+
+	if (parent == NULL || name == NULL) {
+		return -EINVAL;
+	}
+
+	req.opcode = opcode;
+	req.handle = parent->ino;
+	req.name = name;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_status_complete, fsdev_io);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return IO_STATUS_ASYNC;
+}
+
+static int
+fsssd_unlink(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
+{
+	return fsssd_remove_name(ch, fsdev_io, fsssd_cmd_nfs_remove,
+				 fsdev_io->u_in.unlink.parent_fobject, fsdev_io->u_in.unlink.name);
+}
+
+static int
+fsssd_rmdir(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
+{
+	return fsssd_remove_name(ch, fsdev_io, fsssd_cmd_nfs_rmdir,
+				 fsdev_io->u_in.rmdir.parent_fobject, fsdev_io->u_in.rmdir.name);
+}
+
+static void
+fsssd_setattr_complete(void *cb_arg, int status, const struct fsssd_response *rsp)
+{
+	struct spdk_fsdev_io *fsdev_io = cb_arg;
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct spdk_fsdev_file_object *fobject = fsdev_io->u_in.setattr.fobject;
+	struct fsssd_attr attr;
+
+	UNUSED(rsp);
+
+	if (status == 0) {
+		fsssd_client_attr_from_wire(&attr, &fsssd_io->wire_attr, fobject->ino);
+		fsssd_attr_to_fsdev(&attr, &fsdev_io->u_out.setattr.attr);
+	}
+
+	spdk_fsdev_io_complete(fsdev_io, status);
+}
+
+/*
+ * fsdev FSDEV_SET_ATTR_* -> kernel struct iattr. The device only honours
+ * ATTR_{MODE,UID,GID,SIZE,ATIME,MTIME,CTIME} and takes the times verbatim,
+ * so *_NOW is resolved here and ctime is stamped like notify_change() does.
+ */
+static void
+fsssd_iattr_from_fsdev(struct fsssd_nfs_iattr *ia, const struct spdk_fsdev_file_attr *attr,
+		       uint32_t to_set)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_REALTIME, &now);
+	memset(ia, 0, sizeof(*ia));
+
+	if (to_set & FSDEV_SET_ATTR_MODE) {
+		ia->ia_valid |= FSSSD_ATTR_MODE;
+		ia->ia_mode = attr->mode;
+	}
+	if (to_set & FSDEV_SET_ATTR_UID) {
+		ia->ia_valid |= FSSSD_ATTR_UID;
+		ia->ia_uid = attr->uid;
+	}
+	if (to_set & FSDEV_SET_ATTR_GID) {
+		ia->ia_valid |= FSSSD_ATTR_GID;
+		ia->ia_gid = attr->gid;
+	}
+	if (to_set & FSDEV_SET_ATTR_SIZE) {
+		ia->ia_valid |= FSSSD_ATTR_SIZE;
+		ia->ia_size = attr->size;
+	}
+	if (to_set & FSDEV_SET_ATTR_ATIME_NOW) {
+		ia->ia_valid |= FSSSD_ATTR_ATIME;
+		ia->ia_atime.tv_sec = now.tv_sec;
+		ia->ia_atime.tv_nsec = now.tv_nsec;
+	} else if (to_set & FSDEV_SET_ATTR_ATIME) {
+		ia->ia_valid |= FSSSD_ATTR_ATIME;
+		ia->ia_atime.tv_sec = attr->atime;
+		ia->ia_atime.tv_nsec = attr->atimensec;
+	}
+	if (to_set & FSDEV_SET_ATTR_MTIME_NOW) {
+		ia->ia_valid |= FSSSD_ATTR_MTIME;
+		ia->ia_mtime.tv_sec = now.tv_sec;
+		ia->ia_mtime.tv_nsec = now.tv_nsec;
+	} else if (to_set & FSDEV_SET_ATTR_MTIME) {
+		ia->ia_valid |= FSSSD_ATTR_MTIME;
+		ia->ia_mtime.tv_sec = attr->mtime;
+		ia->ia_mtime.tv_nsec = attr->mtimensec;
+	}
+	ia->ia_valid |= FSSSD_ATTR_CTIME;
+	if (to_set & FSDEV_SET_ATTR_CTIME) {
+		ia->ia_ctime.tv_sec = attr->ctime;
+		ia->ia_ctime.tv_nsec = attr->ctimensec;
+	} else {
+		ia->ia_ctime.tv_sec = now.tv_sec;
+		ia->ia_ctime.tv_nsec = now.tv_nsec;
+	}
+}
+
+static int
+fsssd_setattr(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
+{
+	struct fsssd_fsdev *vfsdev = fsdev_to_fsssd(fsdev_io->fsdev);
+	struct fsssd_fsdev_io *fsssd_io = fsdev_to_fsssd_io(fsdev_io);
+	struct spdk_fsdev_file_object *fobject = fsdev_io->u_in.setattr.fobject;
+	struct fsssd_request req = {};
+	int rc;
+
+	if (fobject == NULL) {
+		return -EINVAL;
+	}
+
+	fsssd_iattr_from_fsdev(&fsssd_io->wire_iattr, &fsdev_io->u_in.setattr.attr,
+			       fsdev_io->u_in.setattr.to_set);
+	req.opcode = fsssd_cmd_nfs_setattr;
+	req.handle = fobject->ino;
+	req.payload = &fsssd_io->wire_iattr;
+	req.payload_len = sizeof(fsssd_io->wire_iattr);
+	req.obj_attr = &fsssd_io->wire_attr;
+	rc = fsssd_submit_async(ch, vfsdev, &req, fsssd_setattr_complete, fsdev_io);
 	if (rc != 0) {
 		return rc;
 	}
@@ -773,6 +990,10 @@ static fsdev_op_handler_func fsssd_handlers[] = {
 	[SPDK_FSDEV_IO_LOOKUP] = fsssd_lookup,
 	[SPDK_FSDEV_IO_FORGET] = fsssd_forget,
 	[SPDK_FSDEV_IO_GETATTR] = fsssd_getattr,
+	[SPDK_FSDEV_IO_SETATTR] = fsssd_setattr,
+	[SPDK_FSDEV_IO_MKDIR] = fsssd_mkdir,
+	[SPDK_FSDEV_IO_UNLINK] = fsssd_unlink,
+	[SPDK_FSDEV_IO_RMDIR] = fsssd_rmdir,
 	[SPDK_FSDEV_IO_OPEN] = fsssd_open,
 	[SPDK_FSDEV_IO_CREATE] = fsssd_create,
 	[SPDK_FSDEV_IO_READ] = fsssd_read,

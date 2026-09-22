@@ -24,6 +24,8 @@ struct fsssd_request {
 	uint32_t iovcnt;
 	void *payload;
 	uint32_t payload_len;
+	/* metadata ops: copy of the reply page's OBJ slot on success (optional) */
+	struct fsssd_nfs_fattr *obj_attr;
 };
 
 struct fsssd_response {
@@ -38,6 +40,7 @@ struct fsssd_transport_payload {
 	void *buf;
 	uint32_t len;
 	void *copy_dst;
+	struct fsssd_nfs_fattr *attr_dst;
 	struct iovec *iov;
 	struct iovec *copy_iov;
 	uint64_t *prp_list;
