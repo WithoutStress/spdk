@@ -4,7 +4,7 @@
 #include "spdk/stdinc.h"
 
 #define FSSSD_NFS_PAGE_SIZE 4096
-#define FSSSD_NFS_MAX_NAME_LEN 255	/* cdw3.namelen is u8 */
+#define FSSSD_NFS_MAX_NAME_LEN 255	/* cdw2.namelen is u8 */
 #define FSSSD_NVME_CMD_TIMEOUT_SEC 30
 
 /*
@@ -15,8 +15,35 @@
  * FSSSD_NFS_META_OBJ_OFF and the parent dir's fattr at FSSSD_NFS_META_DIR_OFF.
  */
 #define FSSSD_NFS_META_REQ_OFF 0
+/*
+ * LOOKUP/CREATE/MKDIR/REMOVE/RMDIR names of 1..12 bytes ride inline in
+ * CDW13..15, replacing uid/gid (the device then uses root IDs). NVMe-oF READs
+ * cannot deliver the request page, so longer names only work over PCIe.
+ */
+#define FSSSD_NFS_NAME_INLINE_MAX 12
 #define FSSSD_NFS_META_OBJ_OFF 2048
 #define FSSSD_NFS_META_DIR_OFF 2560
+
+/*
+ * Device node geometry in 4K file pages (inode: 826 data pointers, direct
+ * node: 1018). The device resolves only the node of the starting page, so a
+ * read/write must not span two nodes. Keep in sync with device FW and
+ * client/nfs/internal.h.
+ */
+#define FSSSD_NODE_ADDRS_PER_INODE 826
+#define FSSSD_NODE_ADDRS_PER_BLOCK 1018
+
+/* End (exclusive, in pages) of the node containing @page */
+static inline uint64_t
+fsssd_node_end(uint64_t page)
+{
+	if (page < FSSSD_NODE_ADDRS_PER_INODE) {
+		return FSSSD_NODE_ADDRS_PER_INODE;
+	}
+	return FSSSD_NODE_ADDRS_PER_INODE +
+	       ((page - FSSSD_NODE_ADDRS_PER_INODE) / FSSSD_NODE_ADDRS_PER_BLOCK + 1) *
+	       FSSSD_NODE_ADDRS_PER_BLOCK;
+}
 
 /* struct iattr ia_valid bits (linux/fs.h), consumed by the device's setattr */
 #define FSSSD_ATTR_MODE		(1 << 0)
@@ -50,7 +77,15 @@ enum fsssd_nfs_opcode {
 	fsssd_cmd_nfs_pathconf	= 0x6E,
 };
 
-struct fsssd_cdw3 {
+/*
+ * Device command layout (matches client/nfs nfs3_alloc_nvme_cmd_buf):
+ *   CDW2      {opcode, namelen or npages, mode | offset[11:0]}
+ *   CDW3      file handle
+ *   CDW10-11  file offset in pages (readdir: cookie)
+ *   CDW12     npages - 1
+ *   CDW13-15  inline name, or CDW14/15 = uid/gid
+ */
+struct fsssd_cdw2 {
 	union {
 		struct {
 			uint8_t opcode;

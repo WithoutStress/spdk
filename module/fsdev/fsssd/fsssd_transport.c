@@ -290,27 +290,31 @@ fsssd_transport_iov_len(const struct iovec *iov, uint32_t iovcnt, size_t *len)
 	return 0;
 }
 
+/* Copy between buf and the byte window [off, off + len) of iov */
 static void
-fsssd_transport_iov_copy_to_buf(void *buf, const struct iovec *iov, uint32_t iovcnt)
+fsssd_transport_iov_copy(const struct iovec *iov, uint32_t iovcnt, size_t off, size_t len,
+			 void *buf, bool to_buf)
 {
-	uint8_t *dst = buf;
+	uint8_t *p = buf;
+	uint8_t *base;
+	size_t n;
 	uint32_t i;
 
-	for (i = 0; i < iovcnt; i++) {
-		memcpy(dst, iov[i].iov_base, iov[i].iov_len);
-		dst += iov[i].iov_len;
-	}
-}
-
-static void
-fsssd_transport_iov_copy_from_buf(struct iovec *iov, uint32_t iovcnt, const void *buf)
-{
-	const uint8_t *src = buf;
-	uint32_t i;
-
-	for (i = 0; i < iovcnt; i++) {
-		memcpy(iov[i].iov_base, src, iov[i].iov_len);
-		src += iov[i].iov_len;
+	for (i = 0; i < iovcnt && len > 0; i++) {
+		if (off >= iov[i].iov_len) {
+			off -= iov[i].iov_len;
+			continue;
+		}
+		base = (uint8_t *)iov[i].iov_base + off;
+		n = spdk_min(iov[i].iov_len - off, len);
+		if (to_buf) {
+			memcpy(p, base, n);
+		} else {
+			memcpy(base, p, n);
+		}
+		p += n;
+		len -= n;
+		off = 0;
 	}
 }
 
@@ -332,7 +336,8 @@ fsssd_transport_prepare_meta_page(const void *data, size_t len, struct fsssd_nfs
 }
 
 static int
-fsssd_transport_prepare_payload(const struct fsssd_request *req,
+fsssd_transport_prepare_payload(const struct fsssd_transport *transport,
+				const struct fsssd_request *req,
 				struct fsssd_transport_payload *payload)
 {
 	size_t name_len;
@@ -350,7 +355,15 @@ fsssd_transport_prepare_payload(const struct fsssd_request *req,
 			return -EINVAL;
 		}
 		name_len = strlen(req->name);
+		if (name_len == 0) {
+			return -EINVAL;
+		}
 		if (name_len > FSSSD_NFS_MAX_NAME_LEN) {
+			return -ENAMETOOLONG;
+		}
+		/* NVMe-oF cannot deliver the request page: only inline names reach the device */
+		if (name_len > FSSSD_NFS_NAME_INLINE_MAX &&
+		    transport->trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
 			return -ENAMETOOLONG;
 		}
 		return fsssd_transport_prepare_meta_page(req->name, name_len, req->obj_attr, payload);
@@ -364,6 +377,11 @@ fsssd_transport_prepare_payload(const struct fsssd_request *req,
 	case fsssd_cmd_nfs_fsstat:
 	case fsssd_cmd_nfs_readdir:
 		if (req->payload == NULL || req->payload_len == 0) {
+			return -EINVAL;
+		}
+		/* readdir: the device fills (CDW12 + 1) whole pages */
+		if (req->opcode == fsssd_cmd_nfs_readdir &&
+		    req->payload_len % FSSSD_NFS_PAGE_SIZE != 0) {
 			return -EINVAL;
 		}
 		payload->buf = spdk_dma_zmalloc(req->payload_len, 0, NULL);
@@ -409,7 +427,8 @@ fsssd_transport_release_payload(struct fsssd_transport_payload *payload, bool su
 		       sizeof(*payload->attr_dst));
 	}
 	if (success && payload->iov_copy_out) {
-		fsssd_transport_iov_copy_from_buf(payload->copy_iov, payload->copy_iovcnt, payload->buf);
+		fsssd_transport_iov_copy(payload->copy_iov, payload->copy_iovcnt, payload->copy_iov_off,
+					 payload->len, payload->buf, false);
 	}
 	if (payload->dma_allocated) {
 		spdk_dma_free(payload->buf);
@@ -430,20 +449,23 @@ fsssd_transport_use_bounce(const struct fsssd_request *req, struct fsssd_transpo
 	payload->dma_allocated = true;
 	payload->copy_iov = payload->iov;
 	payload->copy_iovcnt = payload->iovcnt;
+	payload->copy_iov_off = payload->iov_off;
 	if (req->opcode == fsssd_cmd_nfs_write) {
-		fsssd_transport_iov_copy_to_buf(payload->buf, payload->iov, payload->iovcnt);
+		fsssd_transport_iov_copy(payload->iov, payload->iovcnt, payload->iov_off, payload->len,
+					 payload->buf, true);
 	} else {
 		payload->iov_copy_out = true;
 	}
 	payload->iov = NULL;
 	payload->iovcnt = 0;
+	payload->iov_off = 0;
 
 	return 0;
 }
 
 static int
-fsssd_transport_fill_prps(const struct iovec *iov, uint32_t iovcnt, uint64_t *prps,
-			  uint32_t *nr_prps, int fallback_rc)
+fsssd_transport_fill_prps(const struct iovec *iov, uint32_t iovcnt, size_t off, size_t len,
+			  uint64_t *prps, uint32_t *nr_prps, int fallback_rc)
 {
 	uint64_t phys_len;
 	uint64_t phys_addr;
@@ -456,9 +478,15 @@ fsssd_transport_fill_prps(const struct iovec *iov, uint32_t iovcnt, uint64_t *pr
 
 	*nr_prps = 0;
 	page_remaining = 0;
-	for (i = 0; i < iovcnt; i++) {
-		vaddr = iov[i].iov_base;
-		remaining = iov[i].iov_len;
+	for (i = 0; i < iovcnt && len > 0; i++) {
+		if (off >= iov[i].iov_len) {
+			off -= iov[i].iov_len;
+			continue;
+		}
+		vaddr = (uint8_t *)iov[i].iov_base + off;
+		remaining = spdk_min(iov[i].iov_len - off, len);
+		len -= remaining;
+		off = 0;
 		while (remaining > 0) {
 			phys_len = remaining;
 			phys_addr = spdk_vtophys(vaddr, &phys_len);
@@ -508,12 +536,10 @@ static int
 fsssd_transport_build_prps(struct fsssd_transport_payload *payload, struct spdk_nvme_cmd *cmd)
 {
 	struct iovec iov;
-	const struct iovec *prp_iov;
 	uint64_t prps[FSSSD_PRP_MAX_ENTRIES];
 	uint64_t phys_len;
 	uint64_t prp_list_phys;
 	uint32_t nr_prps = 0;
-	int fallback_rc;
 	int rc;
 
 	if (payload->len == 0) {
@@ -521,17 +547,13 @@ fsssd_transport_build_prps(struct fsssd_transport_payload *payload, struct spdk_
 	}
 
 	if (payload->iov != NULL) {
-		prp_iov = payload->iov;
-		fallback_rc = -EAGAIN;
+		rc = fsssd_transport_fill_prps(payload->iov, payload->iovcnt, payload->iov_off,
+					       payload->len, prps, &nr_prps, -EAGAIN);
 	} else {
 		iov.iov_base = payload->buf;
 		iov.iov_len = payload->len;
-		prp_iov = &iov;
-		fallback_rc = -EFAULT;
+		rc = fsssd_transport_fill_prps(&iov, 1, 0, payload->len, prps, &nr_prps, -EFAULT);
 	}
-
-	rc = fsssd_transport_fill_prps(prp_iov, payload->iov != NULL ? payload->iovcnt : 1,
-				       prps, &nr_prps, fallback_rc);
 	if (rc != 0) {
 		return rc;
 	}
@@ -564,52 +586,71 @@ fsssd_transport_build_prps(struct fsssd_transport_payload *payload, struct spdk_
 
 static void
 fsssd_transport_build_cmd(struct fsssd_transport *transport, const struct fsssd_request *req,
-			  struct spdk_nvme_cmd *cmd)
+			  const struct fsssd_transport_payload *payload, struct spdk_nvme_cmd *cmd)
 {
-	struct fsssd_cdw3 cdw3 = {};
+	struct fsssd_cdw2 cdw2 = {};
+	uint32_t npages = 1;
+	uint64_t slba = 0;
+	uint32_t w[3] = {};
+	size_t name_len;
 
 	memset(cmd, 0, sizeof(*cmd));
-	cdw3.s.opcode = req->opcode;
-	cmd->opc = SPDK_NVME_OPC_FLUSH;
+	cdw2.s.opcode = req->opcode;
+	cmd->opc = SPDK_NVME_OPC_READ;
 	cmd->nsid = transport->nsid;
-	cmd->rsvd2 = req->handle;
-	cmd->rsvd3 = cdw3.val;
 
 	switch (req->opcode) {
+	case fsssd_cmd_nfs_mnt:
+		/* mount keeps the legacy layout: fh 0 in CDW2, opcode word in CDW3 */
+		cmd->opc = SPDK_NVME_OPC_FLUSH;
+		cmd->rsvd3 = cdw2.val;
+		return;
 	case fsssd_cmd_nfs_lookup:
 	case fsssd_cmd_nfs_create:
 	case fsssd_cmd_nfs_mkdir:
 	case fsssd_cmd_nfs_remove:
 	case fsssd_cmd_nfs_rmdir:
 		/* NVMe READ opcode tells the device a reply page is attached */
-		cmd->opc = SPDK_NVME_OPC_READ;
-		cdw3.s.namelen = strlen(req->name);
-		cdw3.s.mode = req->mode;
-		cmd->rsvd3 = cdw3.val;
+		name_len = strlen(req->name);
+		cdw2.s.namelen = name_len;
+		cdw2.s.mode = req->mode;
+		if (name_len <= FSSSD_NFS_NAME_INLINE_MAX) {
+			memcpy(w, req->name, name_len);
+			cmd->cdw13 = w[0];
+			cmd->cdw14 = w[1];
+			cmd->cdw15 = w[2];
+		}
 		break;
 	case fsssd_cmd_nfs_setattr:
-		cmd->opc = SPDK_NVME_OPC_READ;
-		break;
-	case fsssd_cmd_nfs_read:
-		cmd->opc = SPDK_NVME_OPC_READ;
-		cdw3.s.namelen = req->size / FSSSD_NFS_PAGE_SIZE;
-		cmd->rsvd3 = cdw3.val;
-		cmd->cdw13 = req->offset / FSSSD_NFS_PAGE_SIZE;
-		break;
-	case fsssd_cmd_nfs_write:
-		cmd->opc = SPDK_NVME_OPC_WRITE;
-		cdw3.s.namelen = req->size / FSSSD_NFS_PAGE_SIZE;
-		cmd->rsvd3 = cdw3.val;
-		cmd->cdw13 = req->offset / FSSSD_NFS_PAGE_SIZE;
-		break;
 	case fsssd_cmd_nfs_getattr:
 	case fsssd_cmd_nfs_fsstat:
+		cdw2.s.namelen = npages;
+		break;
 	case fsssd_cmd_nfs_readdir:
-		cmd->opc = SPDK_NVME_OPC_READ;
+		npages = payload->len / FSSSD_NFS_PAGE_SIZE;
+		cdw2.s.namelen = npages;
+		slba = req->offset;	/* cookie */
+		break;
+	case fsssd_cmd_nfs_read:
+	case fsssd_cmd_nfs_write:
+		if (req->opcode == fsssd_cmd_nfs_write) {
+			cmd->opc = SPDK_NVME_OPC_WRITE;
+		}
+		npages = req->size / FSSSD_NFS_PAGE_SIZE;
+		cdw2.s.namelen = npages;
+		cdw2.s.mode = req->offset & (FSSSD_NFS_PAGE_SIZE - 1);
+		slba = req->offset / FSSSD_NFS_PAGE_SIZE;
 		break;
 	default:
 		break;
 	}
+
+	cmd->rsvd2 = cdw2.val;
+	cmd->rsvd3 = req->handle;
+	cmd->cdw10 = slba;
+	cmd->cdw11 = slba >> 32;
+	cmd->cdw12 = npages - 1;
+	/* CDW14/15 uid/gid stay 0 (root) unless a name is inline */
 }
 
 static int
@@ -621,7 +662,7 @@ fsssd_transport_submit_nvme(struct fsssd_transport *transport, struct spdk_nvme_
 	struct spdk_nvme_cmd cmd = {};
 	int rc;
 
-	fsssd_transport_build_cmd(transport, req, &cmd);
+	fsssd_transport_build_cmd(transport, req, payload, &cmd);
 	if (payload->len != 0 && transport->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {  /* TODO: it may not support NVMe-oF */
 		rc = fsssd_transport_build_prps(payload, &cmd);
 		if (rc == -EAGAIN) {
@@ -657,22 +698,106 @@ fsssd_transport_submit_nvme(struct fsssd_transport *transport, struct spdk_nvme_
 					  payload->len, cb_fn, cb_arg);
 }
 
-static void
-fsssd_transport_async_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
+/*
+ * Bytes of a read/write before the node boundary it crosses, 0 if it fits in
+ * one node. Like client/nfs, at most one boundary is handled: the smallest
+ * node (826 pages) is larger than any PCIe command (PRP list: 513 pages).
+ */
+static int
+fsssd_transport_split_len(const struct fsssd_request *req, uint32_t *first_len)
 {
-	struct fsssd_transport_async_request *async_req = ctx;
+	uint64_t first = req->offset / FSSSD_NFS_PAGE_SIZE;
+	uint64_t last = first + req->size / FSSSD_NFS_PAGE_SIZE;	/* exclusive */
+	uint64_t end;
+
+	*first_len = 0;
+	if (req->opcode != fsssd_cmd_nfs_read && req->opcode != fsssd_cmd_nfs_write) {
+		return 0;
+	}
+
+	end = fsssd_node_end(first);
+	if (last <= end) {
+		return 0;
+	}
+	if (last > fsssd_node_end(end)) {
+		return -EINVAL;
+	}
+
+	*first_len = (end - first) * FSSSD_NFS_PAGE_SIZE;
+	return 0;
+}
+
+/* Narrow a read/write payload to the byte window [off, off + len) of its data */
+static void
+fsssd_transport_payload_slice(const struct fsssd_transport_payload *src, uint32_t off,
+			      uint32_t len, struct fsssd_transport_payload *dst)
+{
+	memset(dst, 0, sizeof(*dst));
+	dst->len = len;
+	dst->iov = src->iov;
+	dst->iovcnt = src->iovcnt;
+	dst->iov_off = src->iov_off + off;
+	while (dst->iov_off >= dst->iov->iov_len) {
+		dst->iov_off -= dst->iov->iov_len;
+		dst->iov++;
+		dst->iovcnt--;
+	}
+	if (dst->iov_off + len <= dst->iov->iov_len) {
+		dst->buf = (uint8_t *)dst->iov->iov_base + dst->iov_off;
+	}
+}
+
+/*
+ * Merge the halves of a node-boundary split as client/nfs does: either half
+ * failing fails the request, and a short or EOF first half drops the second.
+ */
+static void
+fsssd_transport_async_finish(struct fsssd_transport_async_request *async_req)
+{
+	struct fsssd_transport_sub_request *first = &async_req->sub[0];
+	struct fsssd_transport_sub_request *last = &async_req->sub[1];
+	bool is_read = async_req->opcode == fsssd_cmd_nfs_read;
 	struct fsssd_response rsp = {};
+	uint32_t count;
+	uint32_t eof;
 	int status;
 
-	status = fsssd_transport_cpl_to_errno(async_req->opcode, cpl);
-	if (status == 0) {
-		async_req->rsp.result = cpl->cdw0 | ((uint64_t)cpl->cdw1 << 32);
-		async_req->rsp.data_size = fsssd_transport_data_size(async_req->opcode, cpl->cdw0);
+	status = first->status;
+	if (status == 0 && async_req->nr_sub == 2) {
+		status = last->status;
 	}
-	rsp = async_req->rsp;
 
-	fsssd_transport_release_payload(&async_req->payload, status == 0);
+	if (status == 0 && async_req->nr_sub == 1) {
+		rsp.result = first->cdw0 | ((uint64_t)first->cdw1 << 32);
+		rsp.data_size = fsssd_transport_data_size(async_req->opcode, first->cdw0);
+	} else if (status == 0) {
+		count = fsssd_transport_data_size(async_req->opcode, first->cdw0);
+		eof = is_read ? first->cdw0 & ~FSSSD_NFS_READ_COUNT_MASK : 0;
+		if (eof || count == async_req->first_len) {
+			count += fsssd_transport_data_size(async_req->opcode, last->cdw0);
+			eof |= is_read ? last->cdw0 & ~FSSSD_NFS_READ_COUNT_MASK : 0;
+		}
+		rsp.result = count | eof;
+		rsp.data_size = count;
+	}
+
 	async_req->cb_fn(async_req->cb_arg, status, &rsp);
+}
+
+static void
+fsssd_transport_sub_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	struct fsssd_transport_sub_request *sub = ctx;
+	struct fsssd_transport_async_request *async_req = sub->parent;
+
+	sub->status = fsssd_transport_cpl_to_errno(async_req->opcode, cpl);
+	sub->cdw0 = cpl->cdw0;
+	sub->cdw1 = cpl->cdw1;
+	fsssd_transport_release_payload(&sub->payload, sub->status == 0);
+
+	if (--async_req->outstanding == 0) {
+		fsssd_transport_async_finish(async_req);
+	}
 }
 
 int
@@ -682,6 +807,11 @@ fsssd_transport_submit_async(struct fsssd_transport *transport,
 			     struct fsssd_transport_async_request *async_req,
 			     fsssd_transport_complete_cb cb_fn, void *cb_arg)
 {
+	struct fsssd_transport_payload payload;
+	struct fsssd_transport_sub_request *sub;
+	struct fsssd_request half;
+	uint32_t first_len;
+	uint32_t i;
 	int rc;
 
 	if (transport == NULL || channel == NULL || channel->qpair == NULL ||
@@ -689,8 +819,13 @@ fsssd_transport_submit_async(struct fsssd_transport *transport,
 		return -EINVAL;
 	}
 
+	rc = fsssd_transport_split_len(req, &first_len);
+	if (rc != 0) {
+		return rc;
+	}
+
 	memset(async_req, 0, sizeof(*async_req));
-	rc = fsssd_transport_prepare_payload(req, &async_req->payload);
+	rc = fsssd_transport_prepare_payload(transport, req, &payload);
 	if (rc != 0) {
 		return rc;
 	}
@@ -698,13 +833,49 @@ fsssd_transport_submit_async(struct fsssd_transport *transport,
 	async_req->cb_fn = cb_fn;
 	async_req->cb_arg = cb_arg;
 	async_req->opcode = req->opcode;
-	rc = fsssd_transport_submit_nvme(transport, channel->qpair, req, &async_req->payload,
-					 fsssd_transport_async_complete, async_req);
-	if (rc != 0) {
-		fsssd_transport_release_payload(&async_req->payload, false);
+	async_req->first_len = first_len;
+	async_req->nr_sub = first_len != 0 ? 2 : 1;
+	async_req->outstanding = async_req->nr_sub;
+	async_req->sub[0].parent = async_req;
+	async_req->sub[1].parent = async_req;
+	if (first_len == 0) {
+		async_req->sub[0].payload = payload;
+	} else {
+		/* read/write payloads only reference the caller's iov, nothing to free */
+		fsssd_transport_payload_slice(&payload, 0, first_len, &async_req->sub[0].payload);
+		fsssd_transport_payload_slice(&payload, first_len, payload.len - first_len,
+					      &async_req->sub[1].payload);
+	}
+
+	for (i = 0; i < async_req->nr_sub; i++) {
+		sub = &async_req->sub[i];
+		half = *req;
+		if (first_len != 0) {
+			half.offset = req->offset + (i == 0 ? 0 : first_len);
+			half.size = sub->payload.len;
+		}
+		rc = fsssd_transport_submit_nvme(transport, channel->qpair, &half, &sub->payload,
+						 fsssd_transport_sub_complete, sub);
+		if (rc != 0) {
+			break;
+		}
+	}
+
+	if (rc == 0) {
+		return 0;
+	}
+
+	fsssd_transport_release_payload(&async_req->sub[i].payload, false);
+	if (i == 0) {
+		/* nothing in flight */
 		return rc;
 	}
 
+	/* second half failed to submit: fail the request once the first completes */
+	async_req->sub[i].status = rc;
+	if (--async_req->outstanding == 0) {
+		fsssd_transport_async_finish(async_req);
+	}
 	return 0;
 }
 

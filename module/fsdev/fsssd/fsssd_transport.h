@@ -41,19 +41,35 @@ struct fsssd_transport_payload {
 	uint32_t len;
 	void *copy_dst;
 	struct fsssd_nfs_fattr *attr_dst;
+	/* data is the byte window [iov_off, iov_off + len) of iov */
 	struct iovec *iov;
 	struct iovec *copy_iov;
 	uint64_t *prp_list;
 	uint32_t iovcnt;
+	uint32_t iov_off;
 	uint32_t copy_iovcnt;
+	uint32_t copy_iov_off;
 	bool copy_out;
 	bool iov_copy_out;
 	bool dma_allocated;
 };
 
-struct fsssd_transport_async_request {
+struct fsssd_transport_async_request;
+
+struct fsssd_transport_sub_request {
 	struct fsssd_transport_payload payload;
-	struct fsssd_response rsp;
+	struct fsssd_transport_async_request *parent;
+	uint32_t cdw0;
+	uint32_t cdw1;
+	int status;
+};
+
+struct fsssd_transport_async_request {
+	/* sub[1] is the second half of a read/write split at a node boundary */
+	struct fsssd_transport_sub_request sub[2];
+	uint32_t nr_sub;
+	uint32_t outstanding;
+	uint32_t first_len;
 	fsssd_transport_complete_cb cb_fn;
 	void *cb_arg;
 	enum fsssd_nfs_opcode opcode;
